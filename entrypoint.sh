@@ -114,5 +114,5 @@ fi
 echo "═══════════════════════════════════════════════════════════════════════"
 echo "🚀 Starting application..."
 echo ""
-
-exec su -p user -c "python3 wgp.py --listen $*"
+exec python3 /workspace/wangp_server.py
+echo "Finished "

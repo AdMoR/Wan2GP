@@ -1,4 +1,6 @@
-FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+FROM nvcr.io/nvidia/cuda:13.0.1-cudnn-devel-ubuntu24.04 
+
+#nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
 # Build arg for GPU architectures - specify which CUDA compute capabilities to compile for
 # Common values:
@@ -17,7 +19,7 @@ FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 #
 # Note: Including 8.9 or 9.0 may cause compilation issues on some setups
 # Default includes 8.0 and 8.6 for broad Ampere compatibility
-ARG CUDA_ARCHITECTURES="8.0;8.6"
+ARG CUDA_ARCHITECTURES="12.0"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -25,27 +27,53 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt update && \
     apt install -y \
     python3 python3-pip git wget curl cmake ninja-build \
-    libgl1 libglib2.0-0 ffmpeg && \
+    libgl1 libglib2.0-0 \
+    yasm nasm \
+    libjpeg8-dev libpng-dev libtiff-dev \
+    libxine2-dev && \
     apt clean
+
+ENV NVIDIA_DRIVER_CAPABILITIES=all
+
+# Build FFmpeg 4.4 from source (apt provides 6.x on Ubuntu 24.04)
+RUN wget -q https://ffmpeg.org/releases/ffmpeg-4.4.4.tar.xz && \
+    tar xf ffmpeg-4.4.4.tar.xz && \
+    cd ffmpeg-4.4.4 && \
+    ./configure --prefix=/usr \
+        --enable-shared \
+        --disable-static \
+        --disable-doc \
+        --enable-gpl && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig && \
+    cd .. && rm -rf ffmpeg-4.4.4 ffmpeg-4.4.4.tar.xz
 
 WORKDIR /workspace
 
 COPY requirements.txt .
 
-# Upgrade pip first
-RUN pip install --upgrade pip setuptools wheel
+# Remove decord from requirements — we build it from source below
+RUN sed -i '/decord/Id' requirements.txt
 
 # First install torch with the versions we want, so that stuff in requirements.txt doesn't pull in the generic versions
 # If you change CUDA 12.8 here, you also need to change the FROM docker image at the top
-RUN pip install torch==2.10.0+cu128 torchvision==0.25.0+cu128 torchaudio==2.10.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+RUN python3 -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130 --break-system-packages
 
 # Install requirements if exists
-RUN pip install -r requirements.txt
+RUN python3 -m pip install -r requirements.txt --break-system-packages
+
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+
+
+RUN python3 -m pip install --break-system-packages timm insightface facexlib==0.3.0 torchdiffeq>=0.2.5 tensordict>=0.6.1 
 
 # Install SageAttention from git (patch GPU detection)
 ENV TORCH_CUDA_ARCH_LIST="${CUDA_ARCHITECTURES}"
 ENV FORCE_CUDA="1"
 ENV MAX_JOBS="8"
+ENV PATH=/usr/local/cuda-13.0/bin:$PATH
+ENV LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:$LD_LIBRARY_PATH
 
 COPY <<EOF /tmp/patch_setup.py
 import os
@@ -75,18 +103,34 @@ with open('setup.py', 'w') as f:
     f.write(content)
 EOF
 
-RUN git clone https://github.com/thu-ml/SageAttention.git /tmp/sageattention && \
-    cd /tmp/sageattention && \
-    python3 /tmp/patch_setup.py && \
-    pip install --no-build-isolation .
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=video,compute,utility
 
-RUN useradd -u 1000 -ms /bin/bash user
+#RUN git clone https://github.com/thu-ml/SageAttention.git /tmp/sageattention && \
+#    cd /tmp/sageattention/sageattention3_blackwell && \
+#    pip install --no-build-isolation .
+
+RUN useradd -u 1001 -ms /bin/bash user
 
 RUN chown -R user:user /workspace
 
 RUN mkdir /home/user/.cache && \
     chown -R user:user /home/user/.cache
 
-COPY entrypoint.sh /workspace/entrypoint.sh
+
+RUN git clone --recursive https://github.com/dmlc/decord /tmp/decord && \
+    cd /tmp/decord && mkdir build && cd build && \
+    cmake .. -DUSE_CUDA=0 -DCMAKE_BUILD_TYPE=Release \
+        -DFFMPEG_DIR=/usr && \
+    make -j$(nproc) && \
+    cd /tmp/decord/python && python3 setup.py install
+RUN echo "coucou"
+COPY --chown=user:user . .
+COPY --chown=user:user entrypoint.sh /workspace/entrypoint.sh
+COPY --chown=user:user wangp_server.py /workspace/wangp_server.py
+
+RUN chown user:user /workspace
+
+ENV PYTHONPATH=/workspace
 
 ENTRYPOINT ["/workspace/entrypoint.sh"]
