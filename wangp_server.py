@@ -436,8 +436,18 @@ class JobSubmitRequest(BaseModel):
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 
-@app.get("/health")
+@app.get("/health", summary="Health check")
 async def health() -> dict:
+    """Return server liveness and high-level queue state.
+
+    No authentication required.
+
+    **Response fields**
+    - `status` – always `"ok"` when the server is up
+    - `runtime_loaded` – whether the WanGP model runtime has finished initialising
+    - `generation_in_progress` – `true` while a job is actively running
+    - `queue_depth` – number of jobs currently waiting in the queue
+    """
     in_progress = (
         any(j.status == "running" for j in _job_store.all_jobs()) if _job_store else False
     )
@@ -449,15 +459,46 @@ async def health() -> dict:
     }
 
 
-@app.post("/files/upload", dependencies=[Depends(_check_api_key)])
+@app.post("/files/upload", summary="Upload a media file")
 async def upload_file(file: UploadFile = File(...)) -> dict:
+    """Upload an image, video, audio, or mask file for use in a generation job.
+
+    The returned `file_id` can be referenced in job settings using the
+    `file:<file_id>` syntax for any attachment key (`image_start`, `image_end`,
+    `image_refs`, `video_guide`, `audio_guide`, etc.).
+
+    **Response fields**
+    - `file_id` – opaque identifier to pass as `file:<file_id>` in job settings
+    - `filename` – actual filename stored on disk
+    - `size` – uploaded size in bytes
+    """
     data = await file.read()
     file_id, dest = _upload_store.save(file.filename or "upload", data)
     return {"file_id": file_id, "filename": dest.name, "size": len(data)}
 
 
-@app.post("/jobs", status_code=202, dependencies=[Depends(_check_api_key)])
+@app.post("/jobs", status_code=202, summary="Submit a generation job")
 async def submit_job(body: JobSubmitRequest) -> dict:
+    """Enqueue a new generation job and return immediately (HTTP 202).
+
+    The request body must contain a `settings` object with at minimum:
+    - `model_type` *(required)* – WanGP model identifier (e.g. `"wan"`, `"ltx"`)
+
+    All other generation parameters (`prompt`, `num_frames`, `resolution`, lora
+    weights, attachment keys, etc.) are passed through to the WanGP runtime
+    unchanged.  File attachments must first be uploaded via `POST /files/upload`
+    and referenced as `"file:<file_id>"` strings.
+
+    **Response fields** (202 Accepted)
+    - `job_id` – unique job identifier used for status polling and SSE streaming
+    - `status` – `"queued"`
+    - `queue_position` – zero-based position in the pending queue
+    - `poll_url` – relative URL to poll for status (`GET /jobs/{job_id}`)
+
+    **Errors**
+    - `400` – `model_type` missing from settings
+    - `503` – queue is full (see `WANGP_MAX_QUEUE`)
+    """
     if "model_type" not in body.settings:
         raise HTTPException(
             status_code=400,
@@ -494,8 +535,31 @@ async def submit_job(body: JobSubmitRequest) -> dict:
     }
 
 
-@app.get("/jobs/{job_id}")
-async def get_job(job_id: str, _: None = Depends(_check_api_key)) -> dict:
+@app.get("/jobs/{job_id}", summary="Poll job status")
+async def get_job(job_id: str, request: Request, _: None = Depends(_check_api_key)) -> dict:
+    """Return the current status and result of a generation job.
+
+    **Always present**
+    - `job_id`, `status` – one of `queued | running | completed | failed | cancelled`
+
+    **While queued**
+    - `queue_position` – zero-based position in the pending queue
+
+    **While running**
+    - `queue_position` – `0`
+    - `progress` – completion fraction `[0.0, 1.0]` (if available)
+    - `phase` – current generation phase label (if available)
+
+    **When completed or failed**
+    - `success` – `true` if all tasks succeeded
+    - `generated_files` – list of absolute download URLs (`GET /files/{filename}`);
+      empty list on failure. URLs are only present once the job is done.
+    - `errors` – list of `{message, stage, task_index}` objects
+    - `total_tasks`, `successful_tasks`, `failed_tasks` – task counts
+
+    **Errors**
+    - `404` – job not found (unknown or evicted after TTL)
+    """
     job = _job_store.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -513,7 +577,10 @@ async def get_job(job_id: str, _: None = Depends(_check_api_key)) -> dict:
     if job.done and job.result is not None:
         r = job.result
         resp["success"] = r.success
-        resp["generated_files"] = [Path(f).name for f in r.generated_files]
+        resp["generated_files"] = [
+            str(request.url_for("download_file", filename=Path(f).name))
+            for f in r.generated_files
+        ]
         resp["errors"] = [
             {"message": e.message, "stage": e.stage, "task_index": e.task_index}
             for e in r.errors
@@ -525,8 +592,21 @@ async def get_job(job_id: str, _: None = Depends(_check_api_key)) -> dict:
     return resp
 
 
-@app.delete("/jobs/{job_id}", dependencies=[Depends(_check_api_key)])
+@app.delete("/jobs/{job_id}", summary="Cancel a job")
 async def cancel_job(job_id: str) -> dict:
+    """Request cancellation of a queued or running job.
+
+    - **Queued jobs** are cancelled immediately.
+    - **Running jobs** receive a best-effort cancellation signal; the final status
+      transitions to `cancelled` or `failed` once the generation thread stops.
+    - **Already-finished jobs** return their current status unchanged.
+
+    **Response fields**
+    - `job_id`, `status` – `cancelled` (queued jobs) or `cancelling` (running jobs)
+
+    **Errors**
+    - `404` – job not found
+    """
     job = _job_store.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -547,8 +627,25 @@ async def cancel_job(job_id: str) -> dict:
     return {"job_id": job_id, "status": "cancelling"}
 
 
-@app.get("/jobs/{job_id}/events")
+@app.get("/jobs/{job_id}/events", summary="Stream job events (SSE)")
 async def job_events(job_id: str, request: Request, _: None = Depends(_check_api_key)):
+    """Stream real-time generation events as Server-Sent Events (SSE).
+
+    Events already emitted before the client connects are replayed immediately,
+    making it safe to connect at any point during or after a job's lifetime.
+    The stream closes automatically after a `completed` or `error` terminal event.
+    A keep-alive comment (`: keep-alive`) is sent every 15 s while waiting.
+
+    **Event kinds** (`data` field shape varies by kind)
+    - `progress` – `{phase, status, progress, current_step, total_steps}`
+    - `preview` – same as `progress` plus `image` (base64 JPEG data-URL)
+    - `completed` – `{success, generated_files, errors, total_tasks, successful_tasks, failed_tasks}`
+    - `error` – `{message, stage, task_index}`
+    - `stream` – `{stream, text}` for log/text output
+
+    **Errors**
+    - `404` – job not found
+    """
     job = _job_store.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -588,8 +685,23 @@ async def job_events(job_id: str, request: Request, _: None = Depends(_check_api
     )
 
 
-@app.get("/files/{filename}", dependencies=[Depends(_check_api_key)])
+@app.get("/files/{filename}", summary="Download a generated file")
 async def download_file(filename: str) -> FileResponse:
+    """Download a file produced by a completed generation job.
+
+    `filename` must be a bare filename with no path separators.
+    The `Content-Type` is inferred from the file extension.
+    The response uses `Content-Disposition: attachment` to trigger a browser download.
+
+    URLs for generated files are returned directly by `GET /jobs/{job_id}` in the
+    `generated_files` list once the job is done — clients should use those URLs
+    rather than constructing this path manually.
+
+    **Errors**
+    - `400` – filename contains path separators or `..`
+    - `403` – resolved path escapes the output directory
+    - `404` – file does not exist
+    """
     if "/" in filename or "\\" in filename or ".." in filename:
         raise HTTPException(status_code=400, detail="Invalid filename")
 
