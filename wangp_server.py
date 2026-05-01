@@ -484,7 +484,7 @@ async def submit_job(body: JobSubmitRequest) -> dict:
     The request body must contain a `settings` object with at minimum:
     - `model_type` *(required)* – WanGP model identifier (e.g. `"wan"`, `"ltx"`)
 
-    All other generation parameters (`prompt`, `num_frames`, `resolution`, lora
+    All other generation parameters (`prompt`, `video_length`, `resolution`, lora
     weights, attachment keys, etc.) are passed through to the WanGP runtime
     unchanged.  File attachments must first be uploaded via `POST /files/upload`
     and referenced as `"file:<file_id>"` strings.

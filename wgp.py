@@ -7255,6 +7255,12 @@ def validate_task(task, state):
         return None, "No model_type specified"
 
     inputs = params.copy()
+    # Seed inputs with model-specific defaults so API callers (who don't go through the
+    # Gradio UI) get the same default values as the UI (e.g. sliding_window_size, video_length).
+    # User-supplied values always win because setdefault only fills missing keys.
+    model_defaults = get_default_settings(model_type)
+    for k, v in model_defaults.items():
+        inputs.setdefault(k, v)
     clean_settings(model_type, inputs)
 
     inputs.setdefault('mode', "")
