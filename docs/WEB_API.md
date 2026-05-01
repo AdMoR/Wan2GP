@@ -163,6 +163,29 @@ the only required field.  All other generation parameters (`prompt`, `resolution
 model.  Use WanGP's **Export Settings** button in the web UI to get the exact
 parameter names for any model.
 
+#### Video duration
+
+Use **`video_length`** (not `num_frames` or `duration`) to control the number of
+frames generated:
+
+```json
+"video_length": 97
+```
+
+A few things to keep in mind:
+
+- **Frame-count alignment** — many models require frame counts of the form `n·k + 1`
+  (e.g. LTX-2 requires `8n + 1`: 17, 25, 33, … 97, 105 …).  Values that don't
+  satisfy this constraint are silently rounded **down** to the nearest valid count.
+  For example, `video_length: 100` produces 97 frames on an LTX-2 model.
+- **Model defaults** — if you omit `video_length` the runtime uses the model's own
+  default (e.g. 241 frames for LTX-2 22B, 81 for most Wan models).
+- **Sliding-window models** — for models that support long video generation via a
+  sliding window (LTX-2, Wan 5B …), the `sliding_window_size` parameter controls
+  the window length.  When omitted the model's default window size is used.
+  Setting `video_length` larger than `sliding_window_size` triggers multi-window
+  generation automatically.
+
 **Response `202`**
 
 ```json
