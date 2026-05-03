@@ -1,5 +1,5 @@
 ############# WanGP Copyright DeepBeepMeep 2025-2026 #############
-import os, sys
+import os, sys, uuid
 os.environ["GRADIO_LANG"] = "en"
 p = os.path.dirname(os.path.abspath(__file__))
 if p not in sys.path:
@@ -7875,7 +7875,7 @@ def generate_media(
                     file_name = f"{sanitize_file_name(truncate_for_filesystem(os.path.splitext(os.path.basename(file_name))[0])).strip()}.{extension}"
                     file_name = os.path.basename(get_available_filename(output_dir, file_name))
                 else:
-                    file_name = f"{time_flag}_seed{seed}_{sanitize_file_name(truncate_for_filesystem(save_prompt)).strip()}.{extension}"
+                    file_name = f"{time_flag}_seed{seed}_{uuid.uuid4().hex[:8]}.{extension}"
                 video_path = os.path.join(output_dir, file_name)
 
                 if BGRA_frames is not None:
