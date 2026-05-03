@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 
 import uvicorn
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -475,102 +475,6 @@ async def upload_file(file: UploadFile = File(...)) -> dict:
     data = await file.read()
     file_id, dest = _upload_store.save(file.filename or "upload", data)
     return {"file_id": file_id, "filename": dest.name, "size": len(data)}
-
-
-@app.post("/jobs/video-to-video", status_code=202, summary="Submit a video-to-video job")
-async def submit_v2v_job(
-    request: Request,
-    video: UploadFile = File(..., description="Source video (MP4/WebM)"),
-    prompt: str = Form(..., description="Text prompt describing the desired edits"),
-    model_type: str = Form("ltx2.3_22B_distilled"),
-    resolution: str = Form("1280x720"),
-    frames: int = Form(97),
-    steps: int = Form(8),
-    guidance_scale: float = Form(3.0),
-    flow_shift: float = Form(3.0),
-    seed: int = Form(-1),
-    negative_prompt: str = Form("worst quality, inconsistent motion, blurry, jittery, distorted"),
-    fps: str = Form("24"),
-    denoising_strength: float = Form(0.7, description="How much to regenerate (0=keep source, 1=full generation)"),
-    input_video_strength: float = Form(0.85, description="Video conditioning strength on the latent (0–1)"),
-    _: None = Depends(_check_api_key),
-) -> dict:
-    """Submit a video-to-video generation job.
-
-    Uploads the source video and enqueues a generation job in a single request.
-    The video is conditioned on the text prompt to produce an edited output.
-
-    **Form fields**
-    - `video` *(required)* – source video file (MP4 / WebM)
-    - `prompt` *(required)* – text describing the desired edits / target appearance
-    - `model_type` – LTX model variant (default: `ltx2.3_22B_distilled`)
-    - `resolution` – output resolution `WxH` (default: `1280x720`)
-    - `frames` – frame count, must be 8n+1 (default: `97`)
-    - `steps` – denoising steps; 8 for distilled models (default: `8`)
-    - `guidance_scale` – CFG guidance scale (default: `3.0`)
-    - `flow_shift` – flow-shift value (default: `3.0`)
-    - `seed` – RNG seed; `-1` for random (default: `-1`)
-    - `negative_prompt` – things to avoid in the output
-    - `fps` – output frame-rate string (default: `24`)
-    - `denoising_strength` – 0 = keep source, 1 = fully regenerate (default: `0.7`)
-    - `input_video_strength` – video conditioning strength on the latent (default: `0.85`)
-
-    **Response fields** (202 Accepted)
-    - `job_id`, `status`, `queue_position`, `poll_url` – same as `POST /jobs`
-
-    **Errors**
-    - `503` – queue is full
-    """
-    depth = _job_store.queue_depth()
-    if depth >= WANGP_MAX_QUEUE:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "queue_full",
-                "message": f"Queue depth limit ({WANGP_MAX_QUEUE}) reached",
-                "queue_depth": depth,
-            },
-        )
-
-    video_data = await video.read()
-    file_id, _ = _upload_store.save(video.filename or "upload.mp4", video_data)
-
-    settings: dict[str, Any] = {
-        "model_type": model_type,
-        "prompt": prompt,
-        "negative_prompt": negative_prompt,
-        "resolution": resolution,
-        "video_length": frames,
-        "num_inference_steps": steps,
-        "guidance_scale": guidance_scale,
-        "flow_shift": flow_shift,
-        "seed": seed,
-        "force_fps": fps,
-        # v2v-specific
-        "video_source": f"file:{file_id}",
-        "image_prompt_type": "",
-        "video_prompt_type": "G",
-        "denoising_strength": denoising_strength,
-        "input_video_strength": input_video_strength,
-    }
-
-    job_id = f"job_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-    job = JobState(
-        job_id=job_id,
-        settings=settings,
-        status="queued",
-        queue_position=depth,
-        _loop=_event_loop,
-    )
-    _job_store.add(job)
-    _queue_worker.enqueue(job_id)
-
-    return {
-        "job_id": job_id,
-        "status": "queued",
-        "queue_position": depth,
-        "poll_url": f"/jobs/{job_id}",
-    }
 
 
 @app.post("/jobs", status_code=202, summary="Submit a generation job")
