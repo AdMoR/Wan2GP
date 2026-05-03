@@ -52,11 +52,10 @@ Requests with a missing or wrong key receive `401 Unauthorized`.
 ## Job lifecycle
 
 ```
-POST /jobs                 ↘
-                            queued  →  running  →  completed
-POST /jobs/video-to-video  ↗                    ↘  failed
-                             ↓
-                          cancelled  (via DELETE /jobs/{job_id})
+POST /jobs  →  queued  →  running  →  completed
+                                   ↘  failed
+             ↓
+          cancelled  (via DELETE /jobs/{job_id})
 ```
 
 Jobs are processed one at a time in submission order.  While a job is queued
@@ -140,52 +139,6 @@ To target a specific frame range within an uploaded video, append a virtual-medi
 
 ---
 
-### `POST /jobs/video-to-video`
-
-Upload a source video and enqueue a video-to-video editing job in a single request.
-Returns immediately with HTTP `202 Accepted`.
-
-**Request** — `multipart/form-data`
-
-| Field | Required | Default | Description |
-|---|---|---|---|
-| `video` | ✓ | — | Source video file (MP4 / WebM) |
-| `prompt` | ✓ | — | Text describing the desired edits / target appearance |
-| `model_type` | | `ltx2.3_22B_distilled` | LTX model variant |
-| `resolution` | | `1280x720` | Output resolution `WxH` |
-| `frames` | | `97` | Frame count — must be 8n+1 (17, 25, 33 … 97 …) |
-| `steps` | | `8` | Denoising steps (8 for distilled, 30+ for base models) |
-| `guidance_scale` | | `3.0` | CFG guidance scale |
-| `flow_shift` | | `3.0` | Flow-shift value |
-| `seed` | | `-1` | RNG seed; `-1` for random |
-| `negative_prompt` | | `"worst quality…"` | Things to avoid in the output |
-| `fps` | | `24` | Output frame-rate |
-| `denoising_strength` | | `0.7` | How much to regenerate — `0` keeps source, `1` fully regenerates |
-| `input_video_strength` | | `0.85` | Video conditioning strength on the latent |
-
-`denoising_strength` is the main creative lever: lower values (0.4–0.6) produce
-subtle edits that closely follow the source motion; higher values (0.7–0.9)
-allow larger stylistic changes.
-
-**Response `202`** — same shape as `POST /jobs`:
-
-```json
-{
-  "job_id": "job_1714500000_c1d3e5f7",
-  "status": "queued",
-  "queue_position": 0,
-  "poll_url": "/jobs/job_1714500000_c1d3e5f7"
-}
-```
-
-**Errors**
-
-| Status | `error` key | Description |
-|---|---|---|
-| `503` | `queue_full` | Pending queue is at capacity (`WANGP_MAX_QUEUE`) |
-
----
-
 ### `POST /jobs`
 
 Enqueue a new generation job.  Returns immediately with HTTP `202 Accepted`.
@@ -250,6 +203,36 @@ A few things to keep in mind:
 | `status` | string | `"queued"` |
 | `queue_position` | integer | Zero-based position in the pending queue |
 | `poll_url` | string | Relative URL to poll for status |
+
+#### Video-to-video
+
+To edit an existing video, upload it first with `POST /files/upload`, then
+reference it via `video_source`.  The key settings:
+
+| Setting | Value | Description |
+|---|---|---|
+| `video_source` | `"file:<file_id>"` | Uploaded source video |
+| `image_prompt_type` | `""` | Disable start/end image conditioning |
+| `video_prompt_type` | `"G"` | Enable video conditioning |
+| `denoising_strength` | `0.4`–`0.9` | Main creative lever — lower = closer to source |
+| `input_video_strength` | `0.85` | Latent conditioning strength |
+
+```json
+{
+  "settings": {
+    "model_type": "ltx2.3_22B_distilled",
+    "prompt": "same scene but at night, neon lights reflecting on wet pavement",
+    "video_source": "file:upload_1714500000_a3f7c2b1",
+    "image_prompt_type": "",
+    "video_prompt_type": "G",
+    "denoising_strength": 0.7,
+    "input_video_strength": 0.85,
+    "resolution": "1280x720",
+    "video_length": 97,
+    "num_inference_steps": 8
+  }
+}
+```
 
 **Errors**
 
@@ -550,54 +533,6 @@ else:
     for err in status.get("errors", []):
         print("Error:", err["message"])
 ```
-
-### Video-to-video (Python + curl)
-
-**Python (`httpx`)**
-
-```python
-import time
-import httpx
-
-BASE = "http://localhost:8082"
-HEADERS = {"X-API-Key": "my-secret"}
-
-client = httpx.Client(base_url=BASE, headers=HEADERS)
-
-with open("input.mp4", "rb") as f:
-    job = client.post("/jobs/video-to-video", data={
-        "prompt": "same scene but at night, neon lights reflecting on wet pavement",
-        "denoising_strength": "0.7",
-    }, files={"video": f}).json()
-
-job_id = job["job_id"]
-print("Queued:", job_id)
-
-while True:
-    status = client.get(f"/jobs/{job_id}").json()
-    if status["status"] in ("completed", "failed", "cancelled"):
-        break
-    time.sleep(2)
-
-if status.get("success"):
-    for url in status["generated_files"]:
-        filename = url.split("/")[-1]
-        with open(filename, "wb") as f:
-            f.write(client.get(f"/files/{filename}").content)
-        print("Saved:", filename)
-```
-
-**curl**
-
-```bash
-curl -s -X POST http://localhost:8082/jobs/video-to-video \
-  -H "X-API-Key: my-secret" \
-  -F "video=@input.mp4" \
-  -F "prompt=same scene but at night, neon lights reflecting on wet pavement" \
-  -F "denoising_strength=0.7"
-```
-
----
 
 ### SSE streaming (Python)
 
