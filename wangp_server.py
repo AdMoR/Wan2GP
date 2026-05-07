@@ -433,6 +433,22 @@ class JobSubmitRequest(BaseModel):
     settings: dict[str, Any]
 
 
+class V2VJobRequest(BaseModel):
+    video_guide: str  # "file:<file_id>" from POST /files/upload
+    prompt: str
+    model_type: str = "ltx2.3_22B_distilled"
+    negative_prompt: str = "worst quality, inconsistent motion, blurry, jittery, distorted"
+    resolution: str = "1280x720"
+    video_length: int = 97
+    num_inference_steps: int = 8
+    guidance_scale: float = 3.0
+    flow_shift: float = 3.0
+    seed: int = -1
+    force_fps: str = "24"
+    denoising_strength: float = 0.7
+    input_video_strength: float = 0.85
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 
@@ -477,6 +493,38 @@ async def upload_file(file: UploadFile = File(...)) -> dict:
     return {"file_id": file_id, "filename": dest.name, "size": len(data)}
 
 
+def _enqueue_settings(settings: dict[str, Any]) -> dict:
+    """Validate queue capacity, create a JobState, and enqueue it. Returns the 202 response dict."""
+    depth = _job_store.queue_depth()
+    if depth >= WANGP_MAX_QUEUE:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "queue_full",
+                "message": f"Queue depth limit ({WANGP_MAX_QUEUE}) reached",
+                "queue_depth": depth,
+            },
+        )
+
+    job_id = f"job_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+    job = JobState(
+        job_id=job_id,
+        settings=settings,
+        status="queued",
+        queue_position=depth,
+        _loop=_event_loop,
+    )
+    _job_store.add(job)
+    _queue_worker.enqueue(job_id)
+
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "queue_position": depth,
+        "poll_url": f"/jobs/{job_id}",
+    }
+
+
 @app.post("/jobs", status_code=202, summary="Submit a generation job")
 async def submit_job(body: JobSubmitRequest) -> dict:
     """Enqueue a new generation job and return immediately (HTTP 202).
@@ -505,34 +553,60 @@ async def submit_job(body: JobSubmitRequest) -> dict:
             detail={"error": "validation_error", "message": "model_type is required"},
         )
 
-    depth = _job_store.queue_depth()
-    if depth >= WANGP_MAX_QUEUE:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "queue_full",
-                "message": f"Queue depth limit ({WANGP_MAX_QUEUE}) reached",
-                "queue_depth": depth,
-            },
-        )
+    return _enqueue_settings(body.settings)
 
-    job_id = f"job_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-    job = JobState(
-        job_id=job_id,
-        settings=body.settings,
-        status="queued",
-        queue_position=depth,
-        _loop=_event_loop,
-    )
-    _job_store.add(job)
-    _queue_worker.enqueue(job_id)
 
-    return {
-        "job_id": job_id,
-        "status": "queued",
-        "queue_position": depth,
-        "poll_url": f"/jobs/{job_id}",
+@app.post("/jobs/v2v", status_code=202, summary="Submit a video-to-video job")
+async def submit_v2v_job(body: V2VJobRequest, _: None = Depends(_check_api_key)) -> dict:
+    """Enqueue a video-to-video generation job and return immediately (HTTP 202).
+
+    Upload the source video first via `POST /files/upload`, then pass the returned
+    `file_id` as `video_guide` using the `file:<file_id>` syntax.
+
+    Internally this sets `video_prompt_type="VG"` and routes the video through
+    `video_guide` so that WanGP's `validate_settings` preserves both the source
+    video and the requested `denoising_strength` (passing `video_source` with
+    `video_prompt_type="G"` causes both to be silently discarded, making
+    generation identical to text-to-video).
+
+    **Request fields**
+    - `video_guide` *(required)* – `"file:<file_id>"` reference to the source video
+    - `prompt` *(required)* – text prompt describing the desired output
+    - `model_type` – LTX model variant (default: `ltx2.3_22B_distilled`)
+    - `negative_prompt`, `resolution`, `video_length`, `num_inference_steps`,
+      `guidance_scale`, `flow_shift`, `seed`, `force_fps` – standard generation params
+    - `denoising_strength` – how much to regenerate (0 = keep source, 1 = full t2v; default 0.7)
+    - `input_video_strength` – latent conditioning strength of the source video (default 0.85)
+
+    **Response fields** (202 Accepted) — same as `POST /jobs`
+    - `job_id`, `status`, `queue_position`, `poll_url`
+
+    **Errors**
+    - `503` – queue is full
+    """
+    settings: dict[str, Any] = {
+        "model_type": body.model_type,
+        "prompt": body.prompt,
+        "negative_prompt": body.negative_prompt,
+        "resolution": body.resolution,
+        "video_length": body.video_length,
+        "num_inference_steps": body.num_inference_steps,
+        "guidance_scale": body.guidance_scale,
+        "flow_shift": body.flow_shift,
+        "seed": body.seed,
+        "force_fps": body.force_fps,
+        "denoising_strength": body.denoising_strength,
+        "input_video_strength": body.input_video_strength,
+        # v2v-specific: video_guide + "VG" is the correct WanGP wiring.
+        # "V" keeps video_guide alive and routes it through validate_settings;
+        # "G" preserves denoising_strength instead of forcing it to 1.0.
+        "video_guide": body.video_guide,
+        "video_prompt_type": "VG",
+        "video_source": None,
+        "image_prompt_type": "",
     }
+
+    return _enqueue_settings(settings)
 
 
 @app.get("/jobs/{job_id}", summary="Poll job status")

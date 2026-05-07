@@ -52,10 +52,11 @@ Requests with a missing or wrong key receive `401 Unauthorized`.
 ## Job lifecycle
 
 ```
-POST /jobs  →  queued  →  running  →  completed
-                                   ↘  failed
-             ↓
-          cancelled  (via DELETE /jobs/{job_id})
+POST /jobs      ┐
+POST /jobs/v2v  ┘  →  queued  →  running  →  completed
+                                          ↘  failed
+                ↓
+             cancelled  (via DELETE /jobs/{job_id})
 ```
 
 Jobs are processed one at a time in submission order.  While a job is queued
@@ -204,33 +205,69 @@ A few things to keep in mind:
 | `queue_position` | integer | Zero-based position in the pending queue |
 | `poll_url` | string | Relative URL to poll for status |
 
-#### Video-to-video
+**Errors**
 
-To edit an existing video, upload it first with `POST /files/upload`, then
-reference it via `video_source`.  The key settings:
-
-| Setting | Value | Description |
+| Status | `error` key | Description |
 |---|---|---|
-| `video_source` | `"file:<file_id>"` | Uploaded source video |
-| `image_prompt_type` | `""` | Disable start/end image conditioning |
-| `video_prompt_type` | `"G"` | Enable video conditioning |
-| `denoising_strength` | `0.4`–`0.9` | Main creative lever — lower = closer to source |
-| `input_video_strength` | `0.85` | Latent conditioning strength |
+| `400` | `validation_error` | `model_type` missing from settings |
+| `503` | `queue_full` | Pending queue is at capacity (`WANGP_MAX_QUEUE`) |
+
+---
+
+### `POST /jobs/v2v`
+
+Enqueue a video-to-video generation job.  Returns immediately with HTTP `202 Accepted`.
+
+This is the recommended way to run video-to-video.  It accepts named, typed fields
+and hardwires the correct internal WanGP settings so that the source video and
+`denoising_strength` are both honoured by the generation engine.
+
+> **Why not use `POST /jobs` with `video_source` + `video_prompt_type: "G"`?**
+> That combination is silently broken: WanGP's `validate_settings` nullifies
+> `video_source` unless `image_prompt_type` contains `"V"`, and forces
+> `denoising_strength` to `1.0` (full regeneration) unless `video_prompt_type`
+> contains `"V"`.  The result is identical to text-to-video.
+> This endpoint uses `video_guide` + `video_prompt_type: "VG"`, which is the
+> correct wiring.
+
+**Request body** — `application/json`
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `video_guide` | string | *(required)* | `"file:<file_id>"` reference to the uploaded source video |
+| `prompt` | string | *(required)* | Text prompt describing the desired output |
+| `model_type` | string | `"ltx2.3_22B_distilled"` | LTX model variant |
+| `negative_prompt` | string | `"worst quality…"` | Negative prompt |
+| `resolution` | string | `"1280x720"` | Output resolution (`WxH`) |
+| `video_length` | integer | `97` | Frame count — must satisfy `8n + 1` for LTX models |
+| `num_inference_steps` | integer | `8` | Denoising steps (8 for distilled; 30+ for base) |
+| `guidance_scale` | float | `3.0` | CFG guidance scale |
+| `flow_shift` | float | `3.0` | Flow-matching shift |
+| `seed` | integer | `-1` | RNG seed; `-1` = random |
+| `force_fps` | string | `"24"` | Output frame rate |
+| `denoising_strength` | float | `0.7` | Main creative lever — `0` keeps source, `1` = full t2v |
+| `input_video_strength` | float | `0.85` | Latent conditioning strength of the source video |
 
 ```json
 {
-  "settings": {
-    "model_type": "ltx2.3_22B_distilled",
-    "prompt": "same scene but at night, neon lights reflecting on wet pavement",
-    "video_source": "file:upload_1714500000_a3f7c2b1",
-    "image_prompt_type": "",
-    "video_prompt_type": "G",
-    "denoising_strength": 0.7,
-    "input_video_strength": 0.85,
-    "resolution": "1280x720",
-    "video_length": 97,
-    "num_inference_steps": 8
-  }
+  "video_guide": "file:upload_1714500000_a3f7c2b1",
+  "prompt": "same scene but at night, neon lights reflecting on wet pavement",
+  "model_type": "ltx2.3_22B_distilled",
+  "resolution": "1280x720",
+  "video_length": 97,
+  "num_inference_steps": 8,
+  "denoising_strength": 0.7
+}
+```
+
+**Response `202`** — same shape as `POST /jobs`:
+
+```json
+{
+  "job_id": "job_1714500000_b9e2d4f0",
+  "status": "queued",
+  "queue_position": 0,
+  "poll_url": "/jobs/job_1714500000_b9e2d4f0"
 }
 ```
 
@@ -238,7 +275,6 @@ reference it via `video_source`.  The key settings:
 
 | Status | `error` key | Description |
 |---|---|---|
-| `400` | `validation_error` | `model_type` missing from settings |
 | `503` | `queue_full` | Pending queue is at capacity (`WANGP_MAX_QUEUE`) |
 
 ---
@@ -534,6 +570,50 @@ else:
         print("Error:", err["message"])
 ```
 
+### Video-to-video (Python)
+
+```python
+import time
+import httpx
+
+BASE = "http://localhost:8082"
+HEADERS = {"X-API-Key": "my-secret"}
+
+client = httpx.Client(base_url=BASE, headers=HEADERS)
+
+# 1. Upload the source video
+with open("source.mp4", "rb") as f:
+    upload = client.post("/files/upload", files={"file": f}).json()
+
+# 2. Submit the v2v job
+job = client.post("/jobs/v2v", json={
+    "video_guide": f"file:{upload['file_id']}",
+    "prompt": "same scene but at night, neon lights reflecting on wet pavement",
+    "denoising_strength": 0.7,
+    "resolution": "1280x720",
+    "video_length": 97,
+}).json()
+
+job_id = job["job_id"]
+print("Queued:", job_id)
+
+# 3. Poll until done
+while True:
+    status = client.get(f"/jobs/{job_id}").json()
+    print(status["status"], status.get("progress", ""))
+    if status["status"] in ("completed", "failed", "cancelled"):
+        break
+    time.sleep(2)
+
+# 4. Download
+if status.get("success"):
+    for url in status["generated_files"]:
+        filename = url.split("/")[-1]
+        with open(filename, "wb") as f:
+            f.write(client.get(f"/files/{filename}").content)
+        print("Saved:", filename)
+```
+
 ### SSE streaming (Python)
 
 ```python
@@ -576,11 +656,21 @@ with httpx.stream("GET", f"{BASE}/jobs/{job_id}/events", headers=HEADERS) as r:
 # Health check
 curl http://localhost:8082/health
 
-# Submit a job
+# Submit a text-to-video job
 curl -s -X POST http://localhost:8082/jobs \
   -H "Content-Type: application/json" \
   -H "X-API-Key: my-secret" \
   -d '{"settings": {"model_type": "wan", "prompt": "Ocean waves at sunset", "resolution": "832x480", "num_inference_steps": 30, "video_length": 81}}'
+
+# Submit a video-to-video job
+FILE_ID=$(curl -s -X POST http://localhost:8082/files/upload \
+  -H "X-API-Key: my-secret" \
+  -F "file=@source.mp4" | jq -r .file_id)
+
+curl -s -X POST http://localhost:8082/jobs/v2v \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: my-secret" \
+  -d "{\"video_guide\": \"file:$FILE_ID\", \"prompt\": \"same scene but at night\", \"denoising_strength\": 0.7}"
 
 # Poll status
 curl -s http://localhost:8082/jobs/job_1714500000_b9e2d4f0 \
