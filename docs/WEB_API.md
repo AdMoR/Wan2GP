@@ -52,11 +52,10 @@ Requests with a missing or wrong key receive `401 Unauthorized`.
 ## Job lifecycle
 
 ```
-POST /jobs      ┐
-POST /jobs/v2v  ┘  →  queued  →  running  →  completed
-                                          ↘  failed
-                ↓
-             cancelled  (via DELETE /jobs/{job_id})
+POST /jobs  →  queued  →  running  →  completed
+                                   ↘  failed
+            ↓
+         cancelled  (via DELETE /jobs/{job_id})
 ```
 
 Jobs are processed one at a time in submission order.  While a job is queued
@@ -205,76 +204,44 @@ A few things to keep in mind:
 | `queue_position` | integer | Zero-based position in the pending queue |
 | `poll_url` | string | Relative URL to poll for status |
 
+#### Video-to-video
+
+Upload the source video first with `POST /files/upload`, then pass the returned
+`file_id` as `video_guide`.  The server automatically applies the correct WanGP
+wiring (`video_prompt_type: "VG"`) when `video_guide` is present, so
+`denoising_strength` is respected and the source video is not discarded.
+
+> **Do not set `video_prompt_type: "G"` manually.** That combination silently
+> nullifies `video_guide` and forces `denoising_strength` to `1.0`, making the
+> output identical to text-to-video.  The server corrects this automatically when
+> `video_guide` is present, but an explicit `"G"` overrides the fix.
+
+| Setting | Typical value | Description |
+|---|---|---|
+| `video_guide` | `"file:<file_id>"` | Uploaded source video |
+| `denoising_strength` | `0.4`–`0.9` | Main creative lever — lower = closer to source |
+| `input_video_strength` | `0.85` | Latent conditioning strength of the source video |
+
+```json
+{
+  "settings": {
+    "model_type": "ltx2.3_22B_distilled",
+    "prompt": "same scene but at night, neon lights reflecting on wet pavement",
+    "video_guide": "file:upload_1714500000_a3f7c2b1",
+    "denoising_strength": 0.7,
+    "input_video_strength": 0.85,
+    "resolution": "1280x720",
+    "video_length": 97,
+    "num_inference_steps": 8
+  }
+}
+```
+
 **Errors**
 
 | Status | `error` key | Description |
 |---|---|---|
 | `400` | `validation_error` | `model_type` missing from settings |
-| `503` | `queue_full` | Pending queue is at capacity (`WANGP_MAX_QUEUE`) |
-
----
-
-### `POST /jobs/v2v`
-
-Enqueue a video-to-video generation job.  Returns immediately with HTTP `202 Accepted`.
-
-This is the recommended way to run video-to-video.  It accepts named, typed fields
-and hardwires the correct internal WanGP settings so that the source video and
-`denoising_strength` are both honoured by the generation engine.
-
-> **Why not use `POST /jobs` with `video_source` + `video_prompt_type: "G"`?**
-> That combination is silently broken: WanGP's `validate_settings` nullifies
-> `video_source` unless `image_prompt_type` contains `"V"`, and forces
-> `denoising_strength` to `1.0` (full regeneration) unless `video_prompt_type`
-> contains `"V"`.  The result is identical to text-to-video.
-> This endpoint uses `video_guide` + `video_prompt_type: "VG"`, which is the
-> correct wiring.
-
-**Request body** — `application/json`
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `video_guide` | string | *(required)* | `"file:<file_id>"` reference to the uploaded source video |
-| `prompt` | string | *(required)* | Text prompt describing the desired output |
-| `model_type` | string | `"ltx2.3_22B_distilled"` | LTX model variant |
-| `negative_prompt` | string | `"worst quality…"` | Negative prompt |
-| `resolution` | string | `"1280x720"` | Output resolution (`WxH`) |
-| `video_length` | integer | `97` | Frame count — must satisfy `8n + 1` for LTX models |
-| `num_inference_steps` | integer | `8` | Denoising steps (8 for distilled; 30+ for base) |
-| `guidance_scale` | float | `3.0` | CFG guidance scale |
-| `flow_shift` | float | `3.0` | Flow-matching shift |
-| `seed` | integer | `-1` | RNG seed; `-1` = random |
-| `force_fps` | string | `"24"` | Output frame rate |
-| `denoising_strength` | float | `0.7` | Main creative lever — `0` keeps source, `1` = full t2v |
-| `input_video_strength` | float | `0.85` | Latent conditioning strength of the source video |
-
-```json
-{
-  "video_guide": "file:upload_1714500000_a3f7c2b1",
-  "prompt": "same scene but at night, neon lights reflecting on wet pavement",
-  "model_type": "ltx2.3_22B_distilled",
-  "resolution": "1280x720",
-  "video_length": 97,
-  "num_inference_steps": 8,
-  "denoising_strength": 0.7
-}
-```
-
-**Response `202`** — same shape as `POST /jobs`:
-
-```json
-{
-  "job_id": "job_1714500000_b9e2d4f0",
-  "status": "queued",
-  "queue_position": 0,
-  "poll_url": "/jobs/job_1714500000_b9e2d4f0"
-}
-```
-
-**Errors**
-
-| Status | `error` key | Description |
-|---|---|---|
 | `503` | `queue_full` | Pending queue is at capacity (`WANGP_MAX_QUEUE`) |
 
 ---
@@ -586,12 +553,16 @@ with open("source.mp4", "rb") as f:
     upload = client.post("/files/upload", files={"file": f}).json()
 
 # 2. Submit the v2v job
-job = client.post("/jobs/v2v", json={
-    "video_guide": f"file:{upload['file_id']}",
-    "prompt": "same scene but at night, neon lights reflecting on wet pavement",
-    "denoising_strength": 0.7,
-    "resolution": "1280x720",
-    "video_length": 97,
+job = client.post("/jobs", json={
+    "settings": {
+        "model_type": "ltx2.3_22B_distilled",
+        "prompt": "same scene but at night, neon lights reflecting on wet pavement",
+        "video_guide": f"file:{upload['file_id']}",
+        "denoising_strength": 0.7,
+        "resolution": "1280x720",
+        "video_length": 97,
+        "num_inference_steps": 8,
+    }
 }).json()
 
 job_id = job["job_id"]
@@ -667,10 +638,10 @@ FILE_ID=$(curl -s -X POST http://localhost:8082/files/upload \
   -H "X-API-Key: my-secret" \
   -F "file=@source.mp4" | jq -r .file_id)
 
-curl -s -X POST http://localhost:8082/jobs/v2v \
+curl -s -X POST http://localhost:8082/jobs \
   -H "Content-Type: application/json" \
   -H "X-API-Key: my-secret" \
-  -d "{\"video_guide\": \"file:$FILE_ID\", \"prompt\": \"same scene but at night\", \"denoising_strength\": 0.7}"
+  -d "{\"settings\": {\"model_type\": \"ltx2.3_22B_distilled\", \"prompt\": \"same scene but at night\", \"video_guide\": \"file:$FILE_ID\", \"denoising_strength\": 0.7, \"video_length\": 97, \"num_inference_steps\": 8}}"
 
 # Poll status
 curl -s http://localhost:8082/jobs/job_1714500000_b9e2d4f0 \
