@@ -433,22 +433,6 @@ class JobSubmitRequest(BaseModel):
     settings: dict[str, Any]
 
 
-class V2VJobRequest(BaseModel):
-    video_guide: str  # "file:<file_id>" from POST /files/upload
-    prompt: str
-    model_type: str = "ltx2.3_22B_distilled"
-    negative_prompt: str = "worst quality, inconsistent motion, blurry, jittery, distorted"
-    resolution: str = "1280x720"
-    video_length: int = 97
-    num_inference_steps: int = 8
-    guidance_scale: float = 3.0
-    flow_shift: float = 3.0
-    seed: int = -1
-    force_fps: str = "24"
-    denoising_strength: float = 0.7
-    input_video_strength: float = 0.85
-
-
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 
@@ -525,17 +509,46 @@ def _enqueue_settings(settings: dict[str, Any]) -> dict:
     }
 
 
+def _apply_v2v_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    """Normalise settings for video-to-video when video_guide is present.
+
+    WanGP's validate_settings silently breaks v2v when the caller uses the
+    intuitive-but-wrong combination of video_source + video_prompt_type="G":
+      - video_source is nullified unless image_prompt_type contains "V"
+      - denoising_strength is forced to 1.0 unless video_prompt_type contains "V"
+
+    The correct wiring is video_guide + video_prompt_type="VG":
+      - "V" keeps video_guide alive through validate_settings
+      - "G" preserves the caller's denoising_strength value
+    """
+    if not settings.get("video_guide"):
+        return settings
+    s = dict(settings)
+    s.setdefault("video_prompt_type", "VG")
+    s.setdefault("image_prompt_type", "")
+    s["video_source"] = None  # unused and silently discarded in VG mode anyway
+    return s
+
+
 @app.post("/jobs", status_code=202, summary="Submit a generation job")
-async def submit_job(body: JobSubmitRequest) -> dict:
+async def submit_job(body: JobSubmitRequest, _: None = Depends(_check_api_key)) -> dict:
     """Enqueue a new generation job and return immediately (HTTP 202).
 
     The request body must contain a `settings` object with at minimum:
     - `model_type` *(required)* – WanGP model identifier (e.g. `"wan"`, `"ltx"`)
 
     All other generation parameters (`prompt`, `video_length`, `resolution`, lora
-    weights, attachment keys, etc.) are passed through to the WanGP runtime
-    unchanged.  File attachments must first be uploaded via `POST /files/upload`
-    and referenced as `"file:<file_id>"` strings.
+    weights, attachment keys, etc.) are passed through to the WanGP runtime.
+    File attachments must first be uploaded via `POST /files/upload` and referenced
+    as `"file:<file_id>"` strings.
+
+    **Video-to-video**
+
+    Pass `video_guide` with the uploaded source video and set `denoising_strength`
+    to control how much the output differs from the source (0 = keep source,
+    1 = full regeneration).  `video_prompt_type` defaults to `"VG"` automatically
+    when `video_guide` is present — do not override it with `"G"` alone, which
+    silently discards the source video and forces full regeneration.
 
     **Response fields** (202 Accepted)
     - `job_id` – unique job identifier used for status polling and SSE streaming
@@ -553,60 +566,7 @@ async def submit_job(body: JobSubmitRequest) -> dict:
             detail={"error": "validation_error", "message": "model_type is required"},
         )
 
-    return _enqueue_settings(body.settings)
-
-
-@app.post("/jobs/v2v", status_code=202, summary="Submit a video-to-video job")
-async def submit_v2v_job(body: V2VJobRequest, _: None = Depends(_check_api_key)) -> dict:
-    """Enqueue a video-to-video generation job and return immediately (HTTP 202).
-
-    Upload the source video first via `POST /files/upload`, then pass the returned
-    `file_id` as `video_guide` using the `file:<file_id>` syntax.
-
-    Internally this sets `video_prompt_type="VG"` and routes the video through
-    `video_guide` so that WanGP's `validate_settings` preserves both the source
-    video and the requested `denoising_strength` (passing `video_source` with
-    `video_prompt_type="G"` causes both to be silently discarded, making
-    generation identical to text-to-video).
-
-    **Request fields**
-    - `video_guide` *(required)* – `"file:<file_id>"` reference to the source video
-    - `prompt` *(required)* – text prompt describing the desired output
-    - `model_type` – LTX model variant (default: `ltx2.3_22B_distilled`)
-    - `negative_prompt`, `resolution`, `video_length`, `num_inference_steps`,
-      `guidance_scale`, `flow_shift`, `seed`, `force_fps` – standard generation params
-    - `denoising_strength` – how much to regenerate (0 = keep source, 1 = full t2v; default 0.7)
-    - `input_video_strength` – latent conditioning strength of the source video (default 0.85)
-
-    **Response fields** (202 Accepted) — same as `POST /jobs`
-    - `job_id`, `status`, `queue_position`, `poll_url`
-
-    **Errors**
-    - `503` – queue is full
-    """
-    settings: dict[str, Any] = {
-        "model_type": body.model_type,
-        "prompt": body.prompt,
-        "negative_prompt": body.negative_prompt,
-        "resolution": body.resolution,
-        "video_length": body.video_length,
-        "num_inference_steps": body.num_inference_steps,
-        "guidance_scale": body.guidance_scale,
-        "flow_shift": body.flow_shift,
-        "seed": body.seed,
-        "force_fps": body.force_fps,
-        "denoising_strength": body.denoising_strength,
-        "input_video_strength": body.input_video_strength,
-        # v2v-specific: video_guide + "VG" is the correct WanGP wiring.
-        # "V" keeps video_guide alive and routes it through validate_settings;
-        # "G" preserves denoising_strength instead of forcing it to 1.0.
-        "video_guide": body.video_guide,
-        "video_prompt_type": "VG",
-        "video_source": None,
-        "image_prompt_type": "",
-    }
-
-    return _enqueue_settings(settings)
+    return _enqueue_settings(_apply_v2v_settings(body.settings))
 
 
 @app.get("/jobs/{job_id}", summary="Poll job status")
