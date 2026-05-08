@@ -207,20 +207,48 @@ A few things to keep in mind:
 #### Video-to-video
 
 Upload the source video first with `POST /files/upload`, then pass the returned
-`file_id` as `video_guide`.  The server automatically applies the correct WanGP
-wiring (`video_prompt_type: "VG"`) when `video_guide` is present, so
-`denoising_strength` is respected and the source video is not discarded.
+`file_id` as `video_guide`.  When `video_guide` is present the server
+automatically sets the correct WanGP flags so the guide video is not silently
+discarded.
 
-> **Do not set `video_prompt_type: "G"` manually.** That combination silently
-> nullifies `video_guide` and forces `denoising_strength` to `1.0`, making the
-> output identical to text-to-video.  The server corrects this automatically when
-> `video_guide` is present, but an explicit `"G"` overrides the fix.
+##### Preprocessing mode (`video_prompt_type`)
 
-| Setting | Typical value | Description |
+The `video_prompt_type` field controls how the guide video is pre-processed before
+it is used to condition the model.  The server defaults to `"DVG"` (depth map)
+when `video_guide` is present and `video_prompt_type` is not explicitly set.
+
+| `video_prompt_type` | Label | Notes |
 |---|---|---|
-| `video_guide` | `"file:<file_id>"` | Uploaded source video |
-| `denoising_strength` | `0.4`–`0.9` | Main creative lever — lower = closer to source |
-| `input_video_strength` | `0.85` | Latent conditioning strength of the source video |
+| `"DVG"` | Depth map *(default)* | Strong structural guidance; works without IC-LoRA |
+| `"PVG"` | Human motion (pose) | Best for videos with people; works without IC-LoRA |
+| `"OVG"` | Human motion + alignment | Refined pose extraction; works without IC-LoRA |
+| `"EVG"` | Canny edges | Structure-preserving; works without IC-LoRA |
+| `"VG"` | Raw format | For use with an IC-LoRA only — produces weak guidance without one |
+
+> **Do not use `"VG"` without an IC-LoRA loaded.** Raw mode feeds the guide
+> video's latent tokens directly to the model, but the base distilled model has
+> no trained pathway to respond to raw video conditioning tokens; guidance will
+> appear absent.  The preprocessed modes (`"DVG"`, `"PVG"`, `"EVG"`) extract
+> an explicit structural signal the model was trained on and produce strong,
+> visible guidance without any LoRA.
+
+> **Do not set `video_prompt_type: "G"` manually.** That strips the `"V"` flag,
+> silently discards `video_guide`, and forces `denoising_strength` to `1.0`,
+> making output identical to text-to-video generation.
+
+##### `denoising_strength` — Control Video Strength
+
+For LTX2 v2v, `denoising_strength` is **Control Video Strength** and its
+semantics are the **opposite** of traditional img2img:
+
+- **Higher** = output **closer** to the guide video (strong conditioning)
+- **Lower** = output **less** influenced by the guide video (more creative freedom)
+
+| `denoising_strength` | Effect |
+|---|---|
+| `0.9` – `1.0` | Very close to source; subtle style/lighting changes only |
+| `0.6` – `0.8` | Moderate guidance; noticeable changes while preserving structure |
+| `0.3` – `0.5` | Light guidance; significant regeneration |
 
 ```json
 {
@@ -228,7 +256,8 @@ wiring (`video_prompt_type: "VG"`) when `video_guide` is present, so
     "model_type": "ltx2.3_22B_distilled",
     "prompt": "same scene but at night, neon lights reflecting on wet pavement",
     "video_guide": "file:upload_1714500000_a3f7c2b1",
-    "denoising_strength": 0.7,
+    "video_prompt_type": "DVG",
+    "denoising_strength": 0.8,
     "input_video_strength": 0.85,
     "resolution": "1280x720",
     "video_length": 97,
@@ -553,12 +582,14 @@ with open("source.mp4", "rb") as f:
     upload = client.post("/files/upload", files={"file": f}).json()
 
 # 2. Submit the v2v job
+# denoising_strength is "Control Video Strength" for LTX2: higher = closer to source
 job = client.post("/jobs", json={
     "settings": {
         "model_type": "ltx2.3_22B_distilled",
         "prompt": "same scene but at night, neon lights reflecting on wet pavement",
         "video_guide": f"file:{upload['file_id']}",
-        "denoising_strength": 0.7,
+        "video_prompt_type": "DVG",   # depth-map conditioning (no IC-LoRA required)
+        "denoising_strength": 0.8,    # higher = closer to guide video
         "resolution": "1280x720",
         "video_length": 97,
         "num_inference_steps": 8,
@@ -641,7 +672,7 @@ FILE_ID=$(curl -s -X POST http://localhost:8082/files/upload \
 curl -s -X POST http://localhost:8082/jobs \
   -H "Content-Type: application/json" \
   -H "X-API-Key: my-secret" \
-  -d "{\"settings\": {\"model_type\": \"ltx2.3_22B_distilled\", \"prompt\": \"same scene but at night\", \"video_guide\": \"file:$FILE_ID\", \"denoising_strength\": 0.7, \"video_length\": 97, \"num_inference_steps\": 8}}"
+  -d "{\"settings\": {\"model_type\": \"ltx2.3_22B_distilled\", \"prompt\": \"same scene but at night\", \"video_guide\": \"file:$FILE_ID\", \"video_prompt_type\": \"DVG\", \"denoising_strength\": 0.8, \"video_length\": 97, \"num_inference_steps\": 8}}"
 
 # Poll status
 curl -s http://localhost:8082/jobs/job_1714500000_b9e2d4f0 \
