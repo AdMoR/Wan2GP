@@ -517,14 +517,30 @@ def _apply_v2v_settings(settings: dict[str, Any]) -> dict[str, Any]:
       - video_source is nullified unless image_prompt_type contains "V"
       - denoising_strength is forced to 1.0 unless video_prompt_type contains "V"
 
-    The correct wiring is video_guide + video_prompt_type="VG":
+    The correct wiring is video_guide + video_prompt_type containing "VG":
       - "V" keeps video_guide alive through validate_settings
-      - "G" preserves the caller's denoising_strength value
+      - "G" preserves the caller's denoising_strength value (Control Video Strength)
+
+    Default preprocessing mode is "DVG" (depth map extraction) because:
+      - "VG" (raw) is designed for use with an IC-LoRA; without one, conditioning
+        tokens exist but the base model has no trained attention to exploit them,
+        so the video guide has negligible effect on the output.
+      - "DVG" extracts a depth map from every guide frame, which the distilled
+        model's ControlNet pathway is trained to condition on directly — no LoRA
+        required and produces strong structural guidance.
+
+    Other caller-supplied preprocessing modes ("PVG" pose, "EVG" canny, "OVG"
+    aligned-pose) are respected via setdefault — pass video_prompt_type explicitly
+    to override.
+
+    denoising_strength note: for LTX2 this is "Control Video Strength" where
+    higher values mean the output stays CLOSER to the guide video (0.9 = very
+    close, 0.3 = lightly guided). This is the opposite of traditional img2img.
     """
     if not settings.get("video_guide"):
         return settings
     s = dict(settings)
-    s.setdefault("video_prompt_type", "VG")
+    s.setdefault("video_prompt_type", "DVG")
     s.setdefault("image_prompt_type", "")
     s["video_source"] = None  # unused and silently discarded in VG mode anyway
     return s
@@ -544,11 +560,15 @@ async def submit_job(body: JobSubmitRequest, _: None = Depends(_check_api_key)) 
 
     **Video-to-video**
 
-    Pass `video_guide` with the uploaded source video and set `denoising_strength`
-    to control how much the output differs from the source (0 = keep source,
-    1 = full regeneration).  `video_prompt_type` defaults to `"VG"` automatically
-    when `video_guide` is present — do not override it with `"G"` alone, which
-    silently discards the source video and forces full regeneration.
+    Pass `video_guide` with the uploaded source video.  `video_prompt_type`
+    defaults to `"DVG"` (depth-map conditioning) when `video_guide` is present.
+    Use `"PVG"` for human motion, `"EVG"` for edge/structure guidance.
+    Do not override it with `"G"` alone — that silently discards the source
+    video and forces full regeneration.
+
+    For LTX2, `denoising_strength` is **Control Video Strength**: higher values
+    mean the output stays *closer* to the guide video (0.9 = very close,
+    0.3 = lightly guided).  This is the opposite of traditional img2img.
 
     **Response fields** (202 Accepted)
     - `job_id` – unique job identifier used for status polling and SSE streaming
