@@ -540,6 +540,12 @@ def _apply_v2v_settings(settings: dict[str, Any]) -> dict[str, Any]:
     image_start note: validate_settings nullifies image_start when "S" is absent
     from image_prompt_type. When image_start is provided alongside video_guide,
     "S" is auto-prepended so the start frame is respected.
+
+    transition_frames note: when image_start is present, pass transition_frames=N
+    to blank the first N frames of the guide video. The model freely generates
+    those frames from image_start context, then follows the guide from frame N+1,
+    producing a smooth handoff instead of a hard cut at frame 1. Implemented via
+    keep_frames_video_guide ("{N+1}:-1"). Not supported for model_type="ltxv_13B".
     """
     if not settings.get("video_guide"):
         return settings
@@ -550,6 +556,9 @@ def _apply_v2v_settings(settings: dict[str, Any]) -> dict[str, Any]:
     # validate_settings nullifies image_start when "S" is absent from image_prompt_type
     if s.get("image_start") and "S" not in s["image_prompt_type"]:
         s["image_prompt_type"] = "S" + s["image_prompt_type"]
+    transition_frames = int(s.pop("transition_frames", 0) or 0)
+    if s.get("image_start") and transition_frames > 0:
+        s.setdefault("keep_frames_video_guide", f"{transition_frames + 1}:-1")
     return s
 
 
