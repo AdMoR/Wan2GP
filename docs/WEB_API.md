@@ -288,6 +288,74 @@ semantics are the **opposite** of traditional img2img:
 }
 ```
 
+##### Start frame (`image_start`)
+
+You can pin the first frame of the output by supplying `image_start` alongside
+`video_guide`.  The server automatically adds `"S"` to `image_prompt_type` when
+`image_start` is present, so the start frame is never silently discarded.
+
+Upload the image first with `POST /files/upload`, then reference it as
+`"file:<file_id>"` in `image_start`.
+
+```json
+{
+  "settings": {
+    "model_type": "ltx2_22B_distilled",
+    "prompt": "same scene but at night, neon lights reflecting on wet pavement",
+    "video_guide": "file:upload_1714500000_a3f7c2b1",
+    "image_start": "file:upload_1714500000_c9d1e3f2",
+    "video_prompt_type": "DVG",
+    "denoising_strength": 0.8,
+    "resolution": "1280x720",
+    "video_length": 97,
+    "num_inference_steps": 8,
+    "activated_loras": ["ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"],
+    "loras_multipliers": "1"
+  }
+}
+```
+
+> **Note:** to override the auto-injected `"S"` — for example if you want to
+> suppress start-frame conditioning while still passing `image_start` for another
+> reason — set `image_prompt_type` explicitly in your request.
+
+##### Transition smoothing (`transition_frames`)
+
+With `image_start` pinning frame 0 and `video_guide` driving frames 1+, the model
+can produce a hard visual cut at frame 1.  Pass `transition_frames=N` to soften
+this: the server blanks the first N frames of the guide video so the model freely
+generates those frames from the `image_start` context before guide conditioning
+takes over at frame N+1.
+
+| `transition_frames` | Effect |
+|---|---|
+| `0` *(default)* | Disabled — guide conditioning starts at frame 1 |
+| `8` | ~0.3 s free generation before guide takes over (minimal smoothing) |
+| `16` | ~0.7 s free generation *(recommended starting point)* |
+| `24` | ~1 s free generation before guide takes over (stronger smoothing) |
+
+> **Note:** not supported for `model_type = "ltxv_13B"`.  Explicitly setting
+> `keep_frames_video_guide` in your request takes precedence over this parameter.
+
+```json
+{
+  "settings": {
+    "model_type": "ltx2_22B_distilled",
+    "prompt": "same scene but at night, neon lights reflecting on wet pavement",
+    "video_guide": "file:upload_1714500000_a3f7c2b1",
+    "image_start": "file:upload_1714500000_c9d1e3f2",
+    "transition_frames": 16,
+    "video_prompt_type": "DVG",
+    "denoising_strength": 0.8,
+    "resolution": "1280x720",
+    "video_length": 97,
+    "num_inference_steps": 8,
+    "activated_loras": ["ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"],
+    "loras_multipliers": "1"
+  }
+}
+```
+
 **Errors**
 
 | Status | `error` key | Description |
