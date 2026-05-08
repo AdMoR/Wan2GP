@@ -217,24 +217,45 @@ The `video_prompt_type` field controls how the guide video is pre-processed befo
 it is used to condition the model.  The server defaults to `"DVG"` (depth map)
 when `video_guide` is present and `video_prompt_type` is not explicitly set.
 
-| `video_prompt_type` | Label | Notes |
+| `video_prompt_type` | Label | Requires IC-LoRA |
 |---|---|---|
-| `"DVG"` | Depth map *(default)* | Strong structural guidance; works without IC-LoRA |
-| `"PVG"` | Human motion (pose) | Best for videos with people; works without IC-LoRA |
-| `"OVG"` | Human motion + alignment | Refined pose extraction; works without IC-LoRA |
-| `"EVG"` | Canny edges | Structure-preserving; works without IC-LoRA |
-| `"VG"` | Raw format | For use with an IC-LoRA only — produces weak guidance without one |
+| `"DVG"` | Depth map *(default)* | union-control |
+| `"PVG"` | Human motion (pose) | union-control |
+| `"OVG"` | Human motion + alignment | union-control |
+| `"EVG"` | Canny edges | union-control |
+| `"VG"` | Raw format | task-specific IC-LoRA |
 
-> **Do not use `"VG"` without an IC-LoRA loaded.** Raw mode feeds the guide
-> video's latent tokens directly to the model, but the base distilled model has
-> no trained pathway to respond to raw video conditioning tokens; guidance will
-> appear absent.  The preprocessed modes (`"DVG"`, `"PVG"`, `"EVG"`) extract
-> an explicit structural signal the model was trained on and produce strong,
-> visible guidance without any LoRA.
+All preprocessing modes require an IC-LoRA to be loaded — the model has no trained
+conditioning pathway without one.  `"DVG"`, `"PVG"`, `"OVG"`, and `"EVG"` use the
+**union-control** LoRA (one file covers all four).  `"VG"` (raw) requires a task-specific
+IC-LoRA (refocus, ungrade, uncompress, etc.).
 
 > **Do not set `video_prompt_type: "G"` manually.** That strips the `"V"` flag,
 > silently discards `video_guide`, and forces `denoising_strength` to `1.0`,
 > making output identical to text-to-video generation.
+
+##### Activating the IC-LoRA (`activated_loras` / `loras_multipliers`)
+
+WanGP declares the union-control LoRA in each model's `preload_URLs`, but
+**auto-activation via that mechanism can be unreliable through the HTTP API**.
+Always activate the LoRA explicitly in your request.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `activated_loras` | list of strings | Filenames of LoRAs to load, searched in the model's LoRA directory |
+| `loras_multipliers` | string | Whitespace- or newline-separated multipliers, one per entry in `activated_loras` |
+
+LoRA filenames by model:
+
+| `model_type` | union-control filename |
+|---|---|
+| `ltx2_22B_distilled` | `ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors` |
+| `ltx2_22B_distilled_1_1` | `ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors` |
+| `ltx2_distilled` (19B) | `ltx-2-19b-ic-lora-union-control-ref0.5.safetensors` |
+
+The LoRA file must be present in the model's LoRA directory (`loras/ltx2/` by
+default).  If it has not been downloaded yet, run WanGP's Gradio UI once with any
+DVG/PVG/EVG job — it will download the file automatically.
 
 ##### `denoising_strength` — Control Video Strength
 
@@ -253,15 +274,16 @@ semantics are the **opposite** of traditional img2img:
 ```json
 {
   "settings": {
-    "model_type": "ltx2.3_22B_distilled",
+    "model_type": "ltx2_22B_distilled",
     "prompt": "same scene but at night, neon lights reflecting on wet pavement",
     "video_guide": "file:upload_1714500000_a3f7c2b1",
     "video_prompt_type": "DVG",
     "denoising_strength": 0.8,
-    "input_video_strength": 0.85,
     "resolution": "1280x720",
     "video_length": 97,
-    "num_inference_steps": 8
+    "num_inference_steps": 8,
+    "activated_loras": ["ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"],
+    "loras_multipliers": "1"
   }
 }
 ```
@@ -583,16 +605,19 @@ with open("source.mp4", "rb") as f:
 
 # 2. Submit the v2v job
 # denoising_strength is "Control Video Strength" for LTX2: higher = closer to source
+# activated_loras must be explicit — auto-load via preload_URLs is unreliable via API
 job = client.post("/jobs", json={
     "settings": {
-        "model_type": "ltx2.3_22B_distilled",
+        "model_type": "ltx2_22B_distilled",
         "prompt": "same scene but at night, neon lights reflecting on wet pavement",
         "video_guide": f"file:{upload['file_id']}",
-        "video_prompt_type": "DVG",   # depth-map conditioning (no IC-LoRA required)
+        "video_prompt_type": "DVG",
         "denoising_strength": 0.8,    # higher = closer to guide video
         "resolution": "1280x720",
         "video_length": 97,
         "num_inference_steps": 8,
+        "activated_loras": ["ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"],
+        "loras_multipliers": "1",
     }
 }).json()
 
@@ -672,7 +697,7 @@ FILE_ID=$(curl -s -X POST http://localhost:8082/files/upload \
 curl -s -X POST http://localhost:8082/jobs \
   -H "Content-Type: application/json" \
   -H "X-API-Key: my-secret" \
-  -d "{\"settings\": {\"model_type\": \"ltx2.3_22B_distilled\", \"prompt\": \"same scene but at night\", \"video_guide\": \"file:$FILE_ID\", \"video_prompt_type\": \"DVG\", \"denoising_strength\": 0.8, \"video_length\": 97, \"num_inference_steps\": 8}}"
+  -d "{\"settings\": {\"model_type\": \"ltx2_22B_distilled\", \"prompt\": \"same scene but at night\", \"video_guide\": \"file:$FILE_ID\", \"video_prompt_type\": \"DVG\", \"denoising_strength\": 0.8, \"video_length\": 97, \"num_inference_steps\": 8, \"activated_loras\": [\"ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors\"], \"loras_multipliers\": \"1\"}}"
 
 # Poll status
 curl -s http://localhost:8082/jobs/job_1714500000_b9e2d4f0 \

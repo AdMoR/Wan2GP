@@ -536,6 +536,10 @@ def _apply_v2v_settings(settings: dict[str, Any]) -> dict[str, Any]:
     denoising_strength note: for LTX2 this is "Control Video Strength" where
     higher values mean the output stays CLOSER to the guide video (0.9 = very
     close, 0.3 = lightly guided). This is the opposite of traditional img2img.
+
+    image_start note: validate_settings nullifies image_start when "S" is absent
+    from image_prompt_type. When image_start is provided alongside video_guide,
+    "S" is auto-prepended so the start frame is respected.
     """
     if not settings.get("video_guide"):
         return settings
@@ -543,6 +547,9 @@ def _apply_v2v_settings(settings: dict[str, Any]) -> dict[str, Any]:
     s.setdefault("video_prompt_type", "DVG")
     s.setdefault("image_prompt_type", "")
     s["video_source"] = None  # unused and silently discarded in VG mode anyway
+    # validate_settings nullifies image_start when "S" is absent from image_prompt_type
+    if s.get("image_start") and "S" not in s["image_prompt_type"]:
+        s["image_prompt_type"] = "S" + s["image_prompt_type"]
     return s
 
 
@@ -565,6 +572,13 @@ async def submit_job(body: JobSubmitRequest, _: None = Depends(_check_api_key)) 
     Use `"PVG"` for human motion, `"EVG"` for edge/structure guidance.
     Do not override it with `"G"` alone — that silently discards the source
     video and forces full regeneration.
+
+    All preprocessing modes (DVG, PVG, OVG, EVG) require the union-control
+    IC-LoRA.  Pass it explicitly via `activated_loras` — auto-loading via
+    WanGP's preload_URLs is unreliable through the HTTP API:
+
+        "activated_loras": ["ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"],
+        "loras_multipliers": "1"
 
     For LTX2, `denoising_strength` is **Control Video Strength**: higher values
     mean the output stays *closer* to the guide video (0.9 = very close,
