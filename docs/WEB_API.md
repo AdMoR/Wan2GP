@@ -356,6 +356,94 @@ takes over at frame N+1.
 }
 ```
 
+#### Talking heads — LTX 2/2.3 ID-LoRA
+
+Generates a lip-synced talking head video from a portrait image, a voice audio
+sample, and a text script.  Uses the `id-lora-celebvhq` LoRA to bind visual
+identity (from the image) to voice identity (from the audio sample).
+
+> **Checkpoint requirement:** only available with the **non-distilled DEV** checkpoints
+> `ltx2_22B` (Dev 1.0 or Dev 1.1) and `ltx2_19B`.  Distilled variants
+> (`ltx2_22B_distilled`, `ltx2_22B_distilled_1_1`, all GGUF variants) silently
+> drop this mode — the `"1"` flag is stripped from `audio_prompt_type` at
+> generation time with no error.
+
+##### Required settings
+
+| Setting | Value | Notes |
+|---|---|---|
+| `model_type` | `"ltx2_22B"` or `"ltx2_19B"` | Must be a DEV (two-stage) checkpoint |
+| `audio_prompt_type` | `"A1OF"` | Any string containing `"1"` activates ID-LoRA |
+| `image_start` | `"file:<file_id>"` | Portrait image — defines the speaker's visual identity |
+| `audio_guide` | `"file:<file_id>"` | Voice audio sample — only the first **~4.8 s** are used |
+| `prompt` | string | See tagged syntax below |
+
+##### ID-LoRA auto-loading
+
+The ID-LoRA checkpoint is managed entirely by the runtime:
+
+- **Downloaded automatically** to `loras/ltx2/` via the model's `preload_URLs`
+  when the DEV model is loaded for the first time.
+  - LTX 2.3 22B: `id-lora-celebvhq-ltx2.3.safetensors`
+  - LTX 2.0 19B: `id-lora-celebvhq-ltx2.safetensors`
+- **Applied automatically** inside `get_loras_transformer` when
+  `audio_prompt_type` contains `"1"` — no `activated_loras` entry is needed.
+
+This differs from the IC-LoRA used in video-to-video mode, which must be
+activated explicitly.
+
+##### Guidance values
+
+The following values are applied automatically when `audio_prompt_type` contains
+`"1"`.  Passing them explicitly in the request overrides the defaults.
+
+| Setting | Auto value | Role |
+|---|---|---|
+| `guidance_scale` | `3.0` | Audio identity guidance scale |
+| `audio_guidance_scale` | `7.0` | Voice CFG scale |
+
+The distilled-LoRA stage-2 multiplier is also adjusted to `0;0.8` (80% instead
+of the usual 100%) to balance identity preservation with motion quality.
+
+##### Prompt tag syntax
+
+The model produces the best results when the prompt uses three tagged sections:
+
+```
+[VISUAL] tight cinematic close-up of a person speaking directly to camera,
+         steady frame, soft natural lighting, photorealistic.
+[SPEECH] The exact spoken text the character should lip-sync to.
+[SOUND]  room tone, subtle ambient noise.
+```
+
+Alternatively, set `"use_prompt_enhancer": true` to let WanGP generate the
+tagged prompt from a plain description automatically.
+
+##### Cost note
+
+10 inference steps (`num_inference_steps: 10`) produce decent results at
+substantially lower cost than the 30-step default.
+
+##### Minimal example
+
+```json
+{
+  "settings": {
+    "model_type": "ltx2_22B",
+    "audio_prompt_type": "A1OF",
+    "image_start": "file:<portrait_file_id>",
+    "audio_guide": "file:<voice_file_id>",
+    "prompt": "[VISUAL] tight cinematic close-up of a person speaking to camera, photorealistic. [SPEECH] Hello, this is a talking heads demo. [SOUND] room tone.",
+    "num_inference_steps": 10,
+    "video_length": 97,
+    "resolution": "1280x720",
+    "sample_solver": "euler",
+    "guidance_scale": 3.0,
+    "audio_guidance_scale": 7.0
+  }
+}
+```
+
 **Errors**
 
 | Status | `error` key | Description |
@@ -709,6 +797,71 @@ if status.get("success"):
         print("Saved:", filename)
 ```
 
+### Talking heads / ID-LoRA (Python)
+
+```python
+import time
+import httpx
+
+BASE = "http://localhost:8082"
+HEADERS = {"X-API-Key": "my-secret"}
+
+client = httpx.Client(base_url=BASE, headers=HEADERS)
+
+# 1. Upload the portrait image
+with open("portrait.jpg", "rb") as f:
+    portrait = client.post("/files/upload", files={"file": f}).json()
+
+# 2. Upload the voice sample (only first ~4.8 s used by the model)
+with open("voice.wav", "rb") as f:
+    voice = client.post("/files/upload", files={"file": f}).json()
+
+# 3. Submit the ID-LoRA talking heads job
+# audio_prompt_type="A1OF" activates ID-LoRA automatically — no activated_loras needed.
+# The id-lora-celebvhq-ltx2.3.safetensors checkpoint is auto-loaded from loras/ltx2/.
+job = client.post("/jobs", json={
+    "settings": {
+        "model_type": "ltx2_22B",         # DEV checkpoint only, NOT distilled
+        "audio_prompt_type": "A1OF",       # activates ID-LoRA voice cloning
+        "image_start": f"file:{portrait['file_id']}",
+        "audio_guide":  f"file:{voice['file_id']}",
+        "prompt": (
+            "[VISUAL] tight cinematic close-up of a person speaking directly to camera, "
+            "steady frame, soft natural lighting, photorealistic. "
+            "[SPEECH] Hello, this is my spoken message. "
+            "[SOUND] room tone, quiet ambient noise."
+        ),
+        "num_inference_steps": 10,         # 10 steps is sufficient for ID-LoRA
+        "video_length": 97,                # ~4 s at 24 fps
+        "resolution": "1280x720",
+        "sample_solver": "euler",
+        "guidance_scale": 3.0,             # LTX2_ID_LORA_GUIDANCE_SCALE
+        "audio_guidance_scale": 7.0,       # LTX2_ID_LORA_AUDIO_CFG_SCALE
+        "alt_guidance_scale": 3.0,
+        "alt_scale": 0.7,
+    }
+}).json()
+
+job_id = job["job_id"]
+print("Queued:", job_id)
+
+# 4. Poll until done
+while True:
+    status = client.get(f"/jobs/{job_id}").json()
+    print(status["status"], status.get("progress", ""))
+    if status["status"] in ("completed", "failed", "cancelled"):
+        break
+    time.sleep(2)
+
+# 5. Download the generated video
+if status.get("success"):
+    for url in status["generated_files"]:
+        filename = url.split("/")[-1]
+        with open(filename, "wb") as f:
+            f.write(client.get(f"/files/{filename}").content)
+        print("Saved:", filename)
+```
+
 ### SSE streaming (Python)
 
 ```python
@@ -756,6 +909,32 @@ curl -s -X POST http://localhost:8082/jobs \
   -H "Content-Type: application/json" \
   -H "X-API-Key: my-secret" \
   -d '{"settings": {"model_type": "wan", "prompt": "Ocean waves at sunset", "resolution": "832x480", "num_inference_steps": 30, "video_length": 81}}'
+
+# Submit a talking heads / ID-LoRA job
+PORTRAIT_ID=$(curl -s -X POST http://localhost:8082/files/upload \
+  -H "X-API-Key: my-secret" \
+  -F "file=@portrait.jpg" | jq -r .file_id)
+
+VOICE_ID=$(curl -s -X POST http://localhost:8082/files/upload \
+  -H "X-API-Key: my-secret" \
+  -F "file=@voice.wav" | jq -r .file_id)
+
+curl -s -X POST http://localhost:8082/jobs \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: my-secret" \
+  -d "{\"settings\": {
+    \"model_type\": \"ltx2_22B\",
+    \"audio_prompt_type\": \"A1OF\",
+    \"image_start\": \"file:$PORTRAIT_ID\",
+    \"audio_guide\": \"file:$VOICE_ID\",
+    \"prompt\": \"[VISUAL] tight cinematic close-up of a person speaking to camera, photorealistic. [SPEECH] Hello, this is a demo. [SOUND] room tone.\",
+    \"num_inference_steps\": 10,
+    \"video_length\": 97,
+    \"resolution\": \"1280x720\",
+    \"sample_solver\": \"euler\",
+    \"guidance_scale\": 3.0,
+    \"audio_guidance_scale\": 7.0
+  }}"
 
 # Submit a video-to-video job
 FILE_ID=$(curl -s -X POST http://localhost:8082/files/upload \
