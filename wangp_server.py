@@ -598,43 +598,6 @@ async def submit_job(body: JobSubmitRequest, _: None = Depends(_check_api_key)) 
     File attachments must first be uploaded via `POST /files/upload` and referenced
     as `"file:<file_id>"` strings.
 
-    **Talking heads — LTX 2/2.3 ID-LoRA**
-
-    Generates a lip-synced talking head video from a portrait image, a voice audio
-    sample, and a text script.  Only available with non-distilled DEV checkpoints
-    (`ltx2_22B` / `ltx2_19B`); distilled variants silently ignore this mode.
-
-    Required settings:
-
-        "model_type":        "ltx2_22B",        # or "ltx2_19B"
-        "audio_prompt_type": "A1OF",            # activates ID-LoRA voice cloning
-        "image_start":       "file:<file_id>",  # portrait — sets visual identity
-        "audio_guide":       "file:<file_id>",  # voice sample — max ~4.8 s used
-        "prompt":            "...",             # see tag syntax below
-
-    The ID-LoRA checkpoint (`id-lora-celebvhq-ltx2.3.safetensors`) is downloaded
-    automatically to `loras/ltx2/` by the model's preload_URLs and applied
-    automatically when `audio_prompt_type` contains `"1"`.  No `activated_loras`
-    entry is needed.
-
-    Guidance values are auto-applied when `audio_prompt_type` is `"A1OF"`:
-    - `guidance_scale` → 3.0 (identity guidance)
-    - `audio_guidance_scale` → 7.0 (voice conditioning)
-    The voice sample is silently truncated to ~4.8 s regardless of input length.
-
-    Recommended prompt syntax uses three tagged sections:
-
-        [VISUAL] tight cinematic close-up of a person speaking to camera,
-                 steady frame, natural lighting, photorealistic.
-        [SPEECH] Hello, this is my spoken text exactly as it should be heard.
-        [SOUND]  room tone, subtle ambient noise.
-
-    Alternatively set `"use_prompt_enhancer": true` to have WanGP generate the
-    tagged prompt from a plain description.
-
-    10 inference steps (`num_inference_steps: 10`) produce decent results at
-    substantially lower cost than the default 30-step setting.
-
     **Video-to-video**
 
     Pass `video_guide` with the uploaded source video.  `video_prompt_type`
