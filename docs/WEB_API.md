@@ -163,6 +163,20 @@ the only required field.  All other generation parameters (`prompt`, `resolution
 model.  Use WanGP's **Export Settings** button in the web UI to get the exact
 parameter names for any model.
 
+#### LTX-2 22B model variants
+
+| `model_type` | Pipeline | Steps | Auto-loaded LoRA | Best for |
+|---|---|---|---|---|
+| `ltx2_22B` | two-stage (dev + distilled-lora phase) | ~30 | `ltx-2.3-22b-distilled-lora-384.safetensors` | Balanced speed/quality |
+| `ltx2_22B_pure_dev` | single-phase dev | ~50 | none | Highest native dev quality |
+| `ltx2_22B_distilled` | distilled (weights baked) | ~8 | none (union-control/outpaint on demand) | Fastest generation, v2v |
+| `ltx2_22B_distilled_1_1` | distilled v1.1 | ~8 | none | Fastest, updated checkpoint |
+
+**`ltx2_22B_pure_dev`** runs the dev model in single-phase mode (`guidance_phases=1`).
+No distilled LoRA is injected — you get the raw dev-model output.  The tradeoff is
+more inference steps (~50 vs ~30) but no LoRA overhead and no distillation artifacts.
+Use it when quality matters more than speed, or when you want to avoid any LoRA interference.
+
 #### Video duration
 
 Use **`video_length`** (not `num_frames` or `duration`) to control the number of
@@ -252,6 +266,9 @@ LoRA filenames by model:
 | `ltx2_22B_distilled` | `ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors` |
 | `ltx2_22B_distilled_1_1` | `ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors` |
 | `ltx2_distilled` (19B) | `ltx-2-19b-ic-lora-union-control-ref0.5.safetensors` |
+
+> **Note:** `ltx2_22B` (dev) and `ltx2_22B_pure_dev` do not support the union-control
+> IC-LoRA and cannot be used with `video_prompt_type` DVG/PVG/OVG/EVG.
 
 The LoRA file must be present in the model's LoRA directory (`loras/ltx2/` by
 default).  If it has not been downloaded yet, run WanGP's Gradio UI once with any
