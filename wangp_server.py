@@ -126,6 +126,30 @@ def resolve_settings(settings: dict, upload_store: UploadStore) -> dict:
     return resolved
 
 
+_MAX_VALUE_LEN = 200
+
+
+def _format_setting_value(v: Any) -> str:
+    """Return a loggable representation of a settings value, skipping binary/large data."""
+    if isinstance(v, bytes):
+        return f"<bytes {len(v):,}>"
+    if isinstance(v, str):
+        if v.startswith("data:") or len(v) > _MAX_VALUE_LEN:
+            return f"<str {len(v):,}>"
+        return repr(v)
+    if isinstance(v, list):
+        parts = [_format_setting_value(item) for item in v]
+        return "[" + ", ".join(parts) + "]"
+    return repr(v)
+
+
+def _log_settings(settings: dict) -> None:
+    lines = ["Received job settings:"]
+    for k, v in settings.items():
+        lines.append(f"  {k}: {_format_setting_value(v)}")
+    log.info("\n".join(lines))
+
+
 # ── Event serialisation ───────────────────────────────────────────────────────
 
 
@@ -646,6 +670,7 @@ async def submit_job(body: JobSubmitRequest, _: None = Depends(_check_api_key)) 
             detail={"error": "validation_error", "message": "model_type is required"},
         )
 
+    _log_settings(body.settings)
     return _enqueue_settings(_apply_v2v_settings(body.settings))
 
 
