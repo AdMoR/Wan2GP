@@ -60,6 +60,7 @@ from .ltx2_runtime import (
     LTX2_PAD_MASKED_CONTROL_VIDEO_TAIL,
 )
 from .ltx_pipelines.distilled import DistilledPipeline
+from .ltx_pipelines.keyframe_interpolation import KeyframeInterpolationPipeline
 from .ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
 from .ltx_pipelines.utils.constants import AUDIO_SAMPLE_RATE, DEFAULT_NEGATIVE_PROMPT
 
@@ -859,6 +860,12 @@ class LTX2:
                 device=self.device,
                 models=pipeline_models,
             )
+        elif pipeline_kind == "keyframe_interpolation":
+            self.pipeline = KeyframeInterpolationPipeline(
+                device=self.device,
+                stage_1_models=pipeline_models,
+                stage_2_models=pipeline_models,
+            )
         else:
             self.pipeline = TI2VidTwoStagesPipeline(
                 device=self.device,
@@ -1650,6 +1657,41 @@ class LTX2:
                 self_refiner_max_plans=self_refiner_max_plans,
                 editanything_ref_images=editanything_ref_images,
                 ltx2_22B_class=ltx2_22B_class,
+            )
+        elif isinstance(self.pipeline, KeyframeInterpolationPipeline):
+            # keyframes: list of [path, frame_idx, strength] provided by the caller via **kwargs.
+            # frame_idx is in pixel space (0-based absolute frame number).
+            raw_keyframes = kwargs.get("keyframes") or []
+            kf_images = [(str(p), int(fi), float(s)) for p, fi, s in raw_keyframes]
+            pipeline_output = self.pipeline(
+                prompt=input_prompt,
+                negative_prompt=negative_prompt,
+                seed=int(seed),
+                height=target_height,
+                width=target_width,
+                num_frames=int(frame_num),
+                frame_rate=float(fps),
+                num_inference_steps=int(sampling_steps),
+                cfg_guidance_scale=float(guide_scale),
+                images=kf_images,
+                audio_cfg_guidance_scale=effective_audio_cfg_scale,
+                cfg_star_switch=cfg_star_switch,
+                apg_switch=apg_switch,
+                perturbation_switch=perturbation_switch,
+                perturbation_layers=perturbation_layers,
+                perturbation_start=perturbation_start,
+                perturbation_end=perturbation_end,
+                alt_guidance_scale=float(alt_guide_scale),
+                alt_scale=float(alt_scale),
+                tiling_config=tiling_config,
+                enhance_prompt=False,
+                audio_conditionings=audio_conditionings,
+                callback=callback,
+                interrupt_check=interrupt_check,
+                loras_slists=loras_slists,
+                text_connectors=text_connectors,
+                masking_source=masking_source,
+                masking_strength=masking_strength,
             )
         else:
             distilled_kwargs = {}
