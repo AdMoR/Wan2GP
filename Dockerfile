@@ -60,6 +60,8 @@ RUN sed -i '/decord/Id' requirements.txt
 # If you change CUDA 12.8 here, you also need to change the FROM docker image at the top
 RUN python3 -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130 --break-system-packages
 
+RUN python3 -m pip install iopath  --break-system-packages
+
 # Install requirements if exists
 RUN python3 -m pip install -r requirements.txt --break-system-packages
 
