@@ -428,6 +428,78 @@ fill in all intermediate frames.  Using `strength < 1.0` on inner keyframes lets
 the model deviate slightly from those reference images while still respecting the
 overall motion arc.
 
+##### Identity reference conditioning (`image_refs` + `"I"` mode)
+
+Pass a photo of a person or object as a reference and the model will generate a video
+where that subject appears consistently throughout — not just in the first frame.
+
+This is different from `image_start`:
+
+| | `image_start` | `image_refs` + `"I"` mode |
+|---|---|---|
+| **Mechanism** | Hard-replaces frame 0 latent | Appends reference tokens attended by all frames |
+| **Scope** | Frame 0 only | Every frame across both pipeline stages |
+| **Constraint** | Exact pixel match at frame 0 | Soft global identity guidance |
+| **Requires IC-LoRA** | No | Yes — union-control LoRA is the trained pathway |
+
+###### Required parameters
+
+| Parameter | Value | Notes |
+|---|---|---|
+| `video_prompt_type` | `"I"` | Activates the reference-conditioning path |
+| `image_refs` | `["file:<id>"]` | Upload with `POST /files/upload`; **exactly one image** for LTX-2 |
+| `activated_loras` | `["ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"]` | Not auto-loaded for `"I"` mode — must be explicit |
+| `loras_multipliers` | `"1"` | Applies only to your `activated_loras`; distilled LoRA manages its own multiplier |
+
+> **`denoising_strength` has no effect in `"I"` mode.** Because `"G"` is absent from
+> `video_prompt_type`, the runtime forces `denoising_strength = 1.0` and `control_strength = 1.0`
+> unconditionally.  To tune identity strength, adjust `loras_multipliers` instead
+> (e.g. `"0.7"` for lighter influence).
+
+> **One reference image only.** LTX-2 rejects `image_refs` lists with more than one entry when
+> `"K"` and `"F"` are absent from `video_prompt_type`.
+
+**`remove_background_images_ref: 1`** — recommended.  Runs background removal on the reference
+image before encoding so the model focuses on the subject rather than the photo's scene.
+
+###### Example
+
+```json
+{
+  "settings": {
+    "model_type": "ltx2_22B",
+    "prompt": "a woman walking through a park, cinematic, soft light",
+    "negative_prompt": "blurry, low quality",
+
+    "video_prompt_type": "I",
+    "image_refs": ["file:upload_1714500000_a3f7c2b1"],
+    "remove_background_images_ref": 1,
+
+    "activated_loras": ["ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"],
+    "loras_multipliers": "1",
+
+    "video_length": 97,
+    "resolution": "832x480",
+    "sample_solver": "distilled_8_steps",
+    "num_inference_steps": 8,
+    "guidance_phases": 2,
+    "guidance_scale": 1.0,
+    "seed": 42
+  }
+}
+```
+
+The LoRA stack that gets assembled at runtime:
+
+| Source | LoRA | Multiplier |
+|---|---|---|
+| Auto (`get_loras_transformer`) | `ltx-2.3-22b-distilled-lora-384-1.1.safetensors` | `"0;1"` (phase 2 only) |
+| Explicit (`activated_loras`) | `ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors` | `"1"` (both phases) |
+
+The distilled LoRA is automatically injected whenever `guidance_phases: 2` and
+`sample_solver: "distilled_8_steps"` are set.  Its multiplier is managed internally —
+your `loras_multipliers` value covers only the LoRAs you list in `activated_loras`.
+
 ---
 
 **Errors**
@@ -844,6 +916,67 @@ else:
         print("Error:", err["message"])
 ```
 
+### Identity reference conditioning (Python)
+
+```python
+import time
+import httpx
+
+BASE = "http://localhost:8082"
+HEADERS = {"X-API-Key": "my-secret"}
+
+client = httpx.Client(base_url=BASE, headers=HEADERS)
+
+# 1. Upload the reference image (person or object to keep consistent)
+with open("reference_person.jpg", "rb") as f:
+    upload = client.post("/files/upload", files={"file": f}).json()
+
+# 2. Submit the identity-reference job
+# The union-control IC-LoRA must be explicit — it is NOT auto-loaded for "I" mode.
+# loras_multipliers applies only to activated_loras; the distilled LoRA is auto-managed.
+job = client.post("/jobs", json={
+    "settings": {
+        "model_type": "ltx2_22B",
+        "prompt": "a woman walking through a park, cinematic, soft light",
+        "negative_prompt": "blurry, low quality",
+        "video_prompt_type": "I",
+        "image_refs": [f"file:{upload['file_id']}"],
+        "remove_background_images_ref": 1,
+        "activated_loras": ["ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"],
+        "loras_multipliers": "1",
+        "video_length": 97,
+        "resolution": "832x480",
+        "sample_solver": "distilled_8_steps",
+        "num_inference_steps": 8,
+        "guidance_phases": 2,
+        "guidance_scale": 1.0,
+        "seed": 42,
+    }
+}).json()
+
+job_id = job["job_id"]
+print("Queued:", job_id, "position", job["queue_position"])
+
+# 3. Poll until done
+while True:
+    status = client.get(f"/jobs/{job_id}").json()
+    print(status["status"], status.get("progress", ""))
+    if status["status"] in ("completed", "failed", "cancelled"):
+        break
+    time.sleep(2)
+
+# 4. Download
+if status.get("success"):
+    for url in status["generated_files"]:
+        filename = url.split("/")[-1]
+        with open(filename, "wb") as f:
+            f.write(client.get(f"/files/{filename}").content)
+        print("Saved:", filename)
+else:
+    for err in status.get("errors", []):
+        print("Error:", err["message"])
+```
+
 ### SSE streaming (Python)
 
 ```python
@@ -912,6 +1045,16 @@ curl -s -X POST http://localhost:8082/jobs \
   -H "X-API-Key: my-secret" \
   -d "{\"settings\": {\"model_type\": \"ltx2_22B_distilled\", \"prompt\": \"same scene but at night\", \"video_guide\": \"file:$FILE_ID\", \"video_prompt_type\": \"DVG\", \"denoising_strength\": 0.8, \"video_length\": 97, \"num_inference_steps\": 8, \"activated_loras\": [\"ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors\"], \"loras_multipliers\": \"1\"}}"
 
+# Submit an identity reference job
+REF_ID=$(curl -s -X POST http://localhost:8082/files/upload \
+  -H "X-API-Key: my-secret" \
+  -F "file=@reference_person.jpg" | jq -r .file_id)
+
+curl -s -X POST http://localhost:8082/jobs \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: my-secret" \
+  -d "{\"settings\": {\"model_type\": \"ltx2_22B\", \"prompt\": \"a woman walking through a park\", \"video_prompt_type\": \"I\", \"image_refs\": [\"file:$REF_ID\"], \"remove_background_images_ref\": 1, \"activated_loras\": [\"ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors\"], \"loras_multipliers\": \"1\", \"video_length\": 97, \"resolution\": \"832x480\", \"sample_solver\": \"distilled_8_steps\", \"num_inference_steps\": 8, \"guidance_phases\": 2}}"
+
 # Poll status
 curl -s http://localhost:8082/jobs/job_1714500000_b9e2d4f0 \
   -H "X-API-Key: my-secret"
@@ -940,5 +1083,6 @@ When the server is running, FastAPI exposes auto-generated documentation at:
 ## See also
 
 - [API.md](API.md) — the underlying Python API (`shared/api.py`) used by this server
+- [SERVER_FLOW.md](SERVER_FLOW.md) — detailed internals: layer-by-layer execution flow, model loading, pipeline dispatch, concurrency model
 - [CLI.md](CLI.md) — command-line usage
 - [GETTING_STARTED.md](GETTING_STARTED.md) — installation and first run
