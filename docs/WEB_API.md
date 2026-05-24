@@ -129,7 +129,7 @@ To reference an uploaded file in job settings, use the `file:<file_id>` syntax:
 
 Supported attachment keys: `image_start`, `image_end`, `image_refs`, `image_guide`,
 `image_mask`, `video_guide`, `video_mask`, `video_source`, `audio_guide`,
-`audio_guide2`, `audio_source`, `custom_guide`.
+`audio_guide2`, `audio_source`, `custom_guide`, `keyframes`.
 
 To target a specific frame range within an uploaded video, append a virtual-media suffix:
 
@@ -171,6 +171,7 @@ parameter names for any model.
 | `ltx2_22B_pure_dev` | single-phase dev | ~50 | none | Highest native dev quality |
 | `ltx2_22B_distilled` | distilled (weights baked) | ~8 | none (union-control/outpaint on demand) | Fastest generation, v2v |
 | `ltx2_22B_distilled_1_1` | distilled v1.1 | ~8 | none | Fastest, updated checkpoint |
+| `ltx2_22B_keyframe` | keyframe interpolation (two-stage) | ~40 | none | Interpolating between N keyframes at arbitrary positions |
 
 **`ltx2_22B_pure_dev`** runs the dev model in single-phase mode (`guidance_phases=1`).
 No distilled LoRA is injected — you get the raw dev-model output.  The tradeoff is
@@ -372,6 +373,62 @@ takes over at frame N+1.
   }
 }
 ```
+
+##### Keyframe interpolation (`ltx2_22B_keyframe`)
+
+The `ltx2_22B_keyframe` model type uses a dedicated two-stage pipeline that generates
+a video by interpolating between any number of keyframe images placed at arbitrary
+frame positions.  It does not use `image_start` / `image_end` — instead, pass a
+`keyframes` list.
+
+###### `keyframes` format
+
+```json
+"keyframes": [
+  ["<path-or-file-ref>", <frame_idx>, <strength>],
+  ...
+]
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `path-or-file-ref` | string | Absolute path on disk **or** `"file:<file_id>"` (from `POST /files/upload`) |
+| `frame_idx` | integer | Absolute frame index in the output video (0-based, pixel space) |
+| `strength` | float | Conditioning strength for this keyframe, `0.0`–`1.0` |
+
+`frame_idx` is a pixel-space frame number: frame `0` is the very first frame, and the
+last valid index is `video_length − 1`.  Keyframes need not be in order in the list,
+but each `frame_idx` must be within the range of the requested `video_length`.
+
+> **Alignment note** — LTX-2 requires `video_length` of the form `8n + 1`
+> (17, 25, 33 … 241).  For a 121-frame video the last valid `frame_idx` is `120`.
+
+###### Example — three keyframes
+
+```json
+{
+  "settings": {
+    "model_type": "ltx2_22B_keyframe",
+    "prompt": "A smooth cinematic transition through an autumn forest",
+    "video_length": 121,
+    "resolution": "1280x720",
+    "num_inference_steps": 40,
+    "seed": 42,
+    "keyframes": [
+      ["file:upload_1714500000_aa11bb22", 0,   1.0],
+      ["file:upload_1714500000_cc33dd44", 60,  1.0],
+      ["file:upload_1714500000_ee55ff66", 120, 1.0]
+    ]
+  }
+}
+```
+
+The pipeline anchors each image at the specified frame position and lets the model
+fill in all intermediate frames.  Using `strength < 1.0` on inner keyframes lets
+the model deviate slightly from those reference images while still respecting the
+overall motion arc.
+
+---
 
 **Errors**
 
@@ -726,6 +783,67 @@ if status.get("success"):
         print("Saved:", filename)
 ```
 
+### Keyframe interpolation (Python)
+
+```python
+import time
+import httpx
+
+BASE = "http://localhost:8082"
+HEADERS = {"X-API-Key": "my-secret"}
+
+client = httpx.Client(base_url=BASE, headers=HEADERS)
+
+# 1. Upload keyframe images
+def upload(path):
+    with open(path, "rb") as f:
+        return client.post("/files/upload", files={"file": f}).json()["file_id"]
+
+fid_start  = upload("frame_start.png")   # frame 0
+fid_mid    = upload("frame_mid.png")     # frame 60
+fid_end    = upload("frame_end.png")     # frame 120
+
+# 2. Submit the keyframe interpolation job
+# video_length must be 8n+1; last valid frame_idx = video_length - 1
+job = client.post("/jobs", json={
+    "settings": {
+        "model_type": "ltx2_22B_keyframe",
+        "prompt": "A smooth cinematic transition through an autumn forest",
+        "video_length": 121,           # 8×15 + 1
+        "resolution": "1280x720",
+        "num_inference_steps": 40,
+        "seed": 42,
+        "keyframes": [
+            [f"file:{fid_start}", 0,   1.0],
+            [f"file:{fid_mid}",   60,  1.0],
+            [f"file:{fid_end}",   120, 1.0],
+        ],
+    }
+}).json()
+
+job_id = job["job_id"]
+print("Queued:", job_id, "position", job["queue_position"])
+
+# 3. Poll until done
+while True:
+    status = client.get(f"/jobs/{job_id}").json()
+    print(status["status"], status.get("progress", ""))
+    if status["status"] in ("completed", "failed", "cancelled"):
+        break
+    time.sleep(5)
+
+# 4. Download result
+if status.get("success"):
+    for url in status["generated_files"]:
+        filename = url.split("/")[-1]
+        with open(filename, "wb") as f:
+            f.write(client.get(f"/files/{filename}").content)
+        print("Saved:", filename)
+else:
+    for err in status.get("errors", []):
+        print("Error:", err["message"])
+```
+
 ### SSE streaming (Python)
 
 ```python
@@ -773,6 +891,16 @@ curl -s -X POST http://localhost:8082/jobs \
   -H "Content-Type: application/json" \
   -H "X-API-Key: my-secret" \
   -d '{"settings": {"model_type": "wan", "prompt": "Ocean waves at sunset", "resolution": "832x480", "num_inference_steps": 30, "video_length": 81}}'
+
+# Submit a keyframe interpolation job
+FID0=$(curl -s -X POST http://localhost:8082/files/upload -H "X-API-Key: my-secret" -F "file=@frame_start.png" | jq -r .file_id)
+FID1=$(curl -s -X POST http://localhost:8082/files/upload -H "X-API-Key: my-secret" -F "file=@frame_mid.png"   | jq -r .file_id)
+FID2=$(curl -s -X POST http://localhost:8082/files/upload -H "X-API-Key: my-secret" -F "file=@frame_end.png"   | jq -r .file_id)
+
+curl -s -X POST http://localhost:8082/jobs \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: my-secret" \
+  -d "{\"settings\": {\"model_type\": \"ltx2_22B_keyframe\", \"prompt\": \"Smooth cinematic transition\", \"video_length\": 121, \"resolution\": \"1280x720\", \"num_inference_steps\": 40, \"keyframes\": [[\"file:$FID0\", 0, 1.0], [\"file:$FID1\", 60, 1.0], [\"file:$FID2\", 120, 1.0]]}}"
 
 # Submit a video-to-video job
 FILE_ID=$(curl -s -X POST http://localhost:8082/files/upload \

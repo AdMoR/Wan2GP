@@ -6532,6 +6532,7 @@ def generate_media(
     state,
     model_type,
     mode,
+    keyframes=None,
     plugin_data=None,
 ):
     wait_for_model_unload()
@@ -7685,6 +7686,7 @@ def generate_media(
                     gen_cache=gen_cache,
                     vae_upsampler=vae_upsampler_session,
                     save_masks=args.save_masks,
+                    keyframes=keyframes,
                 )
                 upsampler_api.release_vae_upsampler(vae_upsampler_handler, vae_upsampler_session)
                 vae_upsampler_session = None
