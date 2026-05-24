@@ -65,6 +65,7 @@ ATTACHMENT_KEYS = [
     "image_start", "image_end", "image_refs", "image_guide", "image_mask",
     "video_guide", "video_mask", "video_source", "audio_guide", "audio_guide2",
     "audio_source", "custom_guide",
+    "keyframes",  # list of [path_or_file_id, frame_idx, strength] for keyframe interpolation
 ]
 
 _SENTINEL = object()

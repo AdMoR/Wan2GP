@@ -52,33 +52,57 @@ class KeyframeInterpolationPipeline:
 
     def __init__(
         self,
-        checkpoint_path: str,
-        distilled_lora: list[LoraPathStrengthAndSDOps],
-        spatial_upsampler_path: str,
-        gemma_root: str,
-        loras: list[LoraPathStrengthAndSDOps],
+        checkpoint_path: str | None = None,
+        distilled_lora: list[LoraPathStrengthAndSDOps] | None = None,
+        spatial_upsampler_path: str | None = None,
+        gemma_root: str | None = None,
+        loras: list[LoraPathStrengthAndSDOps] | None = None,
         device: torch.device = device,
         fp8transformer: bool = False,
+        stage_1_models: object | None = None,
+        stage_2_models: object | None = None,
     ):
         self.device = device
         self.dtype = torch.bfloat16
-        self.stage_1_model_ledger = ModelLedger(
-            dtype=self.dtype,
-            device=device,
-            checkpoint_path=checkpoint_path,
-            spatial_upsampler_path=spatial_upsampler_path,
-            gemma_root_path=gemma_root,
-            loras=loras,
-            fp8transformer=fp8transformer,
-        )
-        self.stage_2_model_ledger = self.stage_1_model_ledger.with_loras(
-            loras=distilled_lora,
-        )
+        self.stage_1_models = stage_1_models
+        self.stage_2_models = stage_2_models or stage_1_models
+        if self.stage_1_models is None:
+            if checkpoint_path is None or gemma_root is None or spatial_upsampler_path is None:
+                raise ValueError("checkpoint_path, gemma_root, and spatial_upsampler_path are required.")
+            self.stage_1_model_ledger = ModelLedger(
+                dtype=self.dtype,
+                device=device,
+                checkpoint_path=checkpoint_path,
+                spatial_upsampler_path=spatial_upsampler_path,
+                gemma_root_path=gemma_root,
+                loras=loras or [],
+                fp8transformer=fp8transformer,
+            )
+            self.stage_2_model_ledger = self.stage_1_model_ledger.with_loras(
+                loras=distilled_lora or [],
+            )
+        else:
+            self.stage_1_model_ledger = None
+            self.stage_2_model_ledger = None
         self.pipeline_components = PipelineComponents(
             dtype=self.dtype,
             device=device,
         )
         self.text_encoder_cache = TextEncoderCache()
+
+    def _get_stage_model(self, stage: int, name: str):
+        """Return the named model component for the given stage.
+
+        Supports both old-style ModelLedger construction and new-style
+        pre-initialized models (matching TI2VidTwoStagesPipeline pattern).
+        """
+        models = self.stage_1_models if stage == 1 else self.stage_2_models
+        ledger = self.stage_1_model_ledger if stage == 1 else self.stage_2_model_ledger
+        if models is not None:
+            return getattr(models, name)
+        if ledger is None:
+            raise ValueError(f"Missing model source for stage {stage} '{name}'.")
+        return getattr(ledger, name)()
 
     @torch.inference_mode()
     def __call__(  # noqa: PLR0913
@@ -128,7 +152,7 @@ class KeyframeInterpolationPipeline:
         audio_cfg_guider = guider_cls(audio_cfg_guidance_scale)
         dtype = torch.bfloat16
 
-        text_encoder = self.stage_1_model_ledger.text_encoder()
+        text_encoder = self._get_stage_model(1, "text_encoder")
         if enhance_prompt:
             prompt = generate_enhanced_prompt(
                 text_encoder, prompt, images[0][0] if len(images) > 0 else None, seed=seed
@@ -157,8 +181,8 @@ class KeyframeInterpolationPipeline:
         v_context_n, a_context_n = context_n
 
         # Stage 1: Initial low resolution video generation.
-        video_encoder = self.stage_1_model_ledger.video_encoder()
-        transformer = self.stage_1_model_ledger.transformer()
+        video_encoder = self._get_stage_model(1, "video_encoder")
+        transformer = self._get_stage_model(1, "transformer")
         bind_interrupt_check(transformer, interrupt_check)
         sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(dtype=torch.float32, device=self.device)
         if loras_slists is not None:
@@ -264,13 +288,13 @@ class KeyframeInterpolationPipeline:
         upscaled_video_latent = upsample_video(
             latent=video_state.latent[:1],
             video_encoder=video_encoder,
-            upsampler=self.stage_2_model_ledger.spatial_upsampler(),
+            upsampler=self._get_stage_model(2, "spatial_upsampler"),
         )
 
         torch.cuda.synchronize()
         cleanup_memory()
 
-        transformer = self.stage_2_model_ledger.transformer()
+        transformer = self._get_stage_model(2, "transformer")
         bind_interrupt_check(transformer, interrupt_check)
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
         if loras_slists is not None:
@@ -363,7 +387,7 @@ class KeyframeInterpolationPipeline:
 
         decoded_video = vae_decode_video_to_tensor(
             video_state.latent,
-            self.stage_2_model_ledger.video_decoder(),
+            self._get_stage_model(2, "video_decoder"),
             tiling_config,
             expected_frames=int(stage_2_output_shape.frames),
             expected_height=int(stage_2_output_shape.height),
@@ -371,7 +395,9 @@ class KeyframeInterpolationPipeline:
             interrupt_check=interrupt_check,
         )
         decoded_audio = vae_decode_audio(
-            audio_state.latent, self.stage_2_model_ledger.audio_decoder(), self.stage_2_model_ledger.vocoder()
+            audio_state.latent,
+            self._get_stage_model(2, "audio_decoder"),
+            self._get_stage_model(2, "vocoder"),
         )
         return decoded_video, decoded_audio
 

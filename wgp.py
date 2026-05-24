@@ -6288,6 +6288,7 @@ def generate_video(
     state,
     model_type,
     mode,
+    keyframes=None,
     plugin_data=None,
 ):
 
@@ -7268,6 +7269,7 @@ def generate_video(
                     frames_relative_positions_list = frames_relative_positions_list,
                     frames_to_inject = frames_to_inject_parsed,
                     verbose_level=verbose_level,
+                    keyframes=keyframes,
                 )
             except Exception as e:
                 if len(control_audio_tracks) > 0 or len(source_audio_tracks) > 0:
