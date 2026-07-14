@@ -42,7 +42,7 @@ loras/
 loras_i2v/
 
 /settings/
-
+uploads
 wgp_config.json
 plugins_local.json
 loras_url_cache.json

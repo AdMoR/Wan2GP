@@ -245,6 +245,11 @@ conditioning pathway without one.  `"DVG"`, `"PVG"`, `"OVG"`, and `"EVG"` use th
 **union-control** LoRA (one file covers all four).  `"VG"` (raw) requires a task-specific
 IC-LoRA (refocus, ungrade, uncompress, etc.).
 
+> **Complete flag reference** — `video_prompt_type`, `image_prompt_type`, `audio_prompt_type`,
+> LoRA auto-loading, and incompatibility rules are fully documented in
+> [PROMPT_FLAGS.md](PROMPT_FLAGS.md).  The same reference is rendered in the
+> **Flag Reference** section of the Swagger UI at `/docs`.
+
 > **Do not set `video_prompt_type: "G"` manually.** That strips the `"V"` flag,
 > silently discards `video_guide`, and forces `denoising_strength` to `1.0`,
 > making output identical to text-to-video generation.
@@ -501,6 +506,55 @@ The distilled LoRA is automatically injected whenever `guidance_phases: 2` and
 your `loras_multipliers` value covers only the LoRAs you list in `activated_loras`.
 
 ---
+
+**Errors**
+
+| Status | `error` key | Description |
+|---|---|---|
+| `400` | `validation_error` | `model_type` missing from settings |
+| `503` | `queue_full` | Pending queue is at capacity (`WANGP_MAX_QUEUE`) |
+
+---
+
+### `POST /jobs/raw`
+
+Identical to `POST /jobs` except **no automatic pre-processing is applied**:
+
+| Behaviour | `POST /jobs` | `POST /jobs/raw` |
+|-----------|-------------|-----------------|
+| `video_prompt_type` when `video_guide` present | defaults to `"DVG"` | taken as-is |
+| `image_prompt_type` when `image_start` present | auto-prepends `"S"` | taken as-is |
+| `transition_frames` | converted to `keep_frames_video_guide` | not converted |
+| `video_source` | set to `null` (unused in VG mode) | taken as-is |
+
+Use this endpoint when you need full control over every `*_prompt_type` flag — for
+example to compose `"KI"`, `"FI"`, `"OVG"`, `"AU"`, or `"&"` (HDR) directly without
+interference from the default helper logic.
+
+**Request / response format** — identical to `POST /jobs` (see above).
+
+**Example — pose-guided v2v with start frame, no auto-defaulting:**
+
+```json
+{
+  "settings": {
+    "model_type": "ltx2_22B_distilled",
+    "prompt": "A dancer performing on stage, cinematic",
+    "video_guide":       "file:upload_1714500000_a3f7c2b1",
+    "video_prompt_type": "PVG",
+    "image_start":       "file:upload_1714500000_c9d1e3f2",
+    "image_prompt_type": "S",
+    "denoising_strength": 0.75,
+    "resolution": "1280x720",
+    "video_length": 97,
+    "num_inference_steps": 8,
+    "activated_loras": ["ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"],
+    "loras_multipliers": "1"
+  }
+}
+```
+
+> See [PROMPT_FLAGS.md](PROMPT_FLAGS.md) for the complete flag reference.
 
 **Errors**
 

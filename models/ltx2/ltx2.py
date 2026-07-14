@@ -939,7 +939,10 @@ class LTX2:
             _append_system_lora("distilled", mult, "distilled-lora")
         if resolved_base_model_type == "ltx2_22B" and VIDEO_PROMPT_HDR_OUTPUT_FLAG in video_prompt_type:
             _append_system_lora("hdr", 1.0, "ic-lora-hdr")
-        if any(letter in video_prompt_type for letter in control_map):
+        needs_identity_control = (
+            "I" in video_prompt_type and "F" not in video_prompt_type and "K" not in video_prompt_type
+        )
+        if any(letter in video_prompt_type for letter in control_map) or needs_identity_control:
             _append_system_lora("union_control", 1.0, "union-control")
         if resolved_base_model_type == "ltx2_22B" and get_outpainting_dims(outpainting_setting, outpainting_ratio) is not None:
             _append_system_lora("outpaint", 1.0, "outpaint")

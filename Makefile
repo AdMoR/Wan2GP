@@ -64,6 +64,7 @@ server: _ensure_cache_dirs
 		$(GPU_FLAGS) \
 		-v  /home/amor/Documents/code_dw/Wan2GP:/workspace \
 		-e ORT_TELEMETRY_DISABLED=1 \
+		-e HF_XET_HIGH_PERFORMANCE=1 \
 		-p $(PORT_SERVER):$(PORT_SERVER) \
 		$(CACHE_MOUNTS) \
 		$(IMAGE_NAME)
@@ -76,6 +77,7 @@ ui: _ensure_cache_dirs
 	docker run --rm -it \
 		--name $(IMAGE_NAME)-ui \
 		$(GPU_FLAGS) \
+		-e HF_XET_HIGH_PERFORMANCE=1 \
 		-p $(PORT_GRADIO):$(PORT_GRADIO) \
 		$(CACHE_MOUNTS) \
 		--entrypoint python3 \

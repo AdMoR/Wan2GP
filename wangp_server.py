@@ -438,7 +438,134 @@ async def lifespan(app: FastAPI):
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
-app = FastAPI(title="WanGP API", version="1.0.0", lifespan=lifespan)
+_FLAG_REFERENCE_MD = """\
+## `video_prompt_type` flags
+
+Flags are concatenated letter codes (e.g. `"DVG"`, `"KI"`, `"VA"`).
+✅ = auto-set by the server when the corresponding input file is present;
+❌ = must be set explicitly.
+
+### Core structural flags
+
+| Code | Name | Triggered by | Auto? | LTX pipeline effect |
+|------|------|-------------|-------|---------------------|
+| `V` | Video guide | `video_guide` | ✅ | Activates conditioning path; without it `denoising_strength` is clamped to 1.0 |
+| `A` | Mask | `video_mask` / `image_mask` | ✅ | Builds masked reinjection source injected at every denoising step |
+| `G` | Guide conditioning | — (auto-included in DVG/PVG/…) | auto | Allows `denoising_strength` < 1; absent → strength forced to 1.0 |
+| `I` | Identity reference | `image_refs` | ❌ | Reference image latents attend every frame across both pipeline stages; requires union-control IC-LoRA |
+| `K` | Keyframe mode | `keyframes` array | ❌ | Switches to `ltx2_22B_keyframe` pipeline; images become latent anchors |
+| `F` | Injected frames | `image_refs` + `frames_positions` | ❌ | Injects images at 1-indexed positions (e.g. `"1 5 10 L"`) during diffusion |
+| `U` | Mask suppressor / identity passthrough | — | ctx | As preprocessing: raw guide passthrough. Combined with `A`: suppresses masking |
+| `&` | HDR output | HDR `video_guide` | ❌ | LogC3 compression on HDR latents; auto-loads HDR IC-LoRA; LTX-2 22B only |
+
+> **⚠️ Never set `"G"` alone** — it discards `video_guide` and forces full t2v regeneration.
+
+### Preprocessing codes — form `XVG` compounds (D/P/O/E auto-load union-control IC-LoRA)
+
+| Code | Compound | Preprocessor | Use case |
+|------|----------|-------------|---------|
+| `D` | `DVG` *(server default)* | Depth map | Preserve scene geometry while changing style |
+| `P` | `PVG` | DWPose skeleton | Transfer human motion |
+| `O` | `OVG` | Aligned pose (aligns to `image_refs` last frame) | Transfer motion while preserving reference body proportions |
+| `E` | `EVG` | Canny edges | Preserve structural outlines |
+| `S` | `SVG` | Scribble / shapes | Loose structural guidance |
+| `L` | `LVG` | Optical flow | Motion-consistent generation |
+| `C` | `CVG` | Grayscale | Luminance-guided generation |
+| `M` | `MVG` | Inpaint mask | Region-specific regeneration |
+| `U` | `UVG` | Identity passthrough (raw) | Task-specific IC-LoRA (refocus, uncompress…) |
+| *(none)* | `VG` | None | Same as UVG |
+
+### Outside-mask preprocessing codes (require `A` also present)
+
+Applied to the **unmasked region**; primary code applies inside the mask.
+
+| `Y` | Depth outside mask | `W` | Scribble outside mask |
+|-----|-------------------|----|----------------------|
+| `X` | Inpaint outside mask | `Z` | Optical flow outside mask |
+
+### Face / bbox codes: `B` = face tracking · `H` = bounding-box
+
+---
+
+## `image_prompt_type` flags
+
+| Code | Name | Triggered by | Auto? | Effect |
+|------|------|-------------|-------|--------|
+| `S` | Start image | `image_start` | ✅ | Replaces frame-0 latent; output pixel-matches `image_start` exactly |
+| `E` | End image | `image_end` | ❌ | Last-frame latent set as a guiding constraint |
+| `V` | Source video | `video_source` | ctx | Source video for continuity / outpainting stitching |
+| `L` | Last video | — | ❌ | Continue from last frame of a previous generation |
+
+---
+
+## `audio_prompt_type` flags
+
+| Code | Name | Effect |
+|------|------|--------|
+| `A` | Audio source | Waveform → mel → AudioEncoder → cross-attention conditioning on all frames |
+| `B` | Audio source #2 | Second track for multi-speaker / MultiTalk models |
+| `K` | Control video audio | Audio extracted from `video_guide`, processed as `A` |
+| `N` | Normalized volumes | Volume normalized before encoding |
+| `O` | Force output audio | Always writes audio track in output |
+| `X` | Multi-talk speaker 2 | Second speaker slot (MultiTalk models) |
+| `1` | ID-LoRA voice | Speaker identity reference; auto-loads `id-lora-celebvhq-ltx2.safetensors` |
+| `2` | Generate audio from video | Freeze control video; generate matching audio (distilled + `VG` only) |
+
+---
+
+## LoRA auto-loading
+
+| Flag(s) | LoRA auto-loaded |
+|---------|-----------------|
+| D/P/O/E or `I` in `video_prompt_type` | `ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors` |
+| `&` in `video_prompt_type` | `ltx-2.3-22b-ic-lora-hdr-0.9.safetensors` |
+| `1` in `audio_prompt_type` | `id-lora-celebvhq-ltx2.safetensors` |
+| `guidance_phases > 1` or `distilled_8_steps` | `ltx-2.3-22b-distilled-lora-384-1.1.safetensors` |
+
+User-supplied `activated_loras` / `loras_multipliers` are **additive** to the auto-loaded stack.
+
+---
+
+## Key incompatibilities
+
+- `"2"` (audio-gen) requires `"VG"`, forbids `"OPDE&AFKI"`
+- `"&"` (HDR) requires `ltx2_22B`, forbids `"OPDE"`, outpainting, and `"F"`
+- `"I"` requires exactly one `image_ref` unless `"K"` or `"F"` is also present
+- `"O"` (pose_align) + mask disables outside-mask processing
+
+See [PROMPT_FLAGS.md](https://github.com/deepbeepmeep/Wan2GP/blob/main/docs/PROMPT_FLAGS.md)\
+ for the full reference with pipeline-level details.
+"""
+
+app = FastAPI(
+    title="WanGP API",
+    version="1.0.0",
+    description=(
+        "Single-worker HTTP API wrapping the WanGP video generation engine.\n\n"
+        "**Standard submission** (`POST /jobs`): auto-preprocessing applied —"
+        " `video_prompt_type` defaults to `\"DVG\"` when `video_guide` is present,"
+        " `image_prompt_type` is auto-prepended with `\"S\"` when `image_start` is"
+        " present.\n\n"
+        "**Raw submission** (`POST /jobs/raw`): no auto-preprocessing — every"
+        " `*_prompt_type` flag is taken exactly as supplied.  See the"
+        " **Flag Reference** section in the sidebar for the complete flag reference."
+    ),
+    openapi_tags=[
+        {
+            "name": "Jobs",
+            "description": "Submit generation jobs, poll status, stream events, and cancel.",
+        },
+        {
+            "name": "Files",
+            "description": "Upload input media files and download generated output files.",
+        },
+        {
+            "name": "Flag Reference",
+            "description": _FLAG_REFERENCE_MD,
+        },
+    ],
+    lifespan=lifespan,
+)
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -461,7 +588,7 @@ class JobSubmitRequest(BaseModel):
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 
-@app.get("/health", summary="Health check")
+@app.get("/health", summary="Health check", tags=["Jobs"])
 async def health() -> dict:
     """Return server liveness and high-level queue state.
 
@@ -484,7 +611,7 @@ async def health() -> dict:
     }
 
 
-@app.post("/files/upload", summary="Upload a media file")
+@app.post("/files/upload", summary="Upload a media file", tags=["Files"])
 async def upload_file(file: UploadFile = File(...)) -> dict:
     """Upload an image, video, audio, or mask file for use in a generation job.
 
@@ -587,7 +714,7 @@ def _apply_v2v_settings(settings: dict[str, Any]) -> dict[str, Any]:
     return s
 
 
-@app.post("/jobs", status_code=202, summary="Submit a generation job")
+@app.post("/jobs", status_code=202, summary="Submit a generation job", tags=["Jobs"])
 async def submit_job(body: JobSubmitRequest, _: None = Depends(_check_api_key)) -> dict:
     """Enqueue a new generation job and return immediately (HTTP 202).
 
@@ -638,7 +765,441 @@ async def submit_job(body: JobSubmitRequest, _: None = Depends(_check_api_key)) 
     return _enqueue_settings(_apply_v2v_settings(body.settings))
 
 
-@app.get("/jobs/{job_id}", summary="Poll job status")
+@app.post("/jobs/raw", status_code=202, summary="Submit a generation job (raw — no auto-preprocessing)", tags=["Jobs", "Flag Reference"])
+async def submit_job_raw(body: JobSubmitRequest, _: None = Depends(_check_api_key)) -> dict:
+    """Enqueue an LTX-2.3 generation job with **no automatic pre-processing**.
+
+    Identical to `POST /jobs` except `_apply_v2v_settings()` is skipped:
+    `video_prompt_type`, `image_prompt_type` and `video_source` are passed exactly
+    as supplied — no `"DVG"` default, no auto-prepend of `"S"`, no `transition_frames`
+    conversion.  Use this endpoint for full manual flag control.
+
+    Upload media first with `POST /files/upload`, then reference it as
+    `"file:<file_id>"` in any attachment field.
+
+    ---
+
+    ## LTX-2.3 model variants
+
+    | `model_type` | Pipeline | Steps | Default frames | Notes |
+    |---|---|---|---|---|
+    | `ltx2_22B` | Two-stage dev + distilled LoRA | ~30 | 241 | Best balance of quality and speed |
+    | `ltx2_22B_pure_dev` | Single-phase dev only | ~50 | 241 | Highest quality, no LoRA overhead |
+    | `ltx2_22B_distilled` | Distilled (weights baked) | 8 | 241 | Fastest; v2v and IC-LoRA supported |
+    | `ltx2_22B_distilled_1_1` | Distilled v1.1 | 8 | 241 | Same as above, updated checkpoint |
+    | `ltx2_22B_keyframe` | Keyframe interpolation (two-stage) | ~40 | 241 | Interpolates between N keyframes |
+
+    > **Frame alignment** — LTX-2 requires `video_length = 8n + 1` (17, 25, 33 … 241).
+    > Values that don't satisfy this are silently rounded **down**.
+
+    ---
+
+    ## Core parameters
+
+    | Field | Type | ltx2_22B | ltx2_22B_pure_dev | ltx2_22B_distilled(_1_1) | ltx2_22B_keyframe |
+    |---|---|---|---|---|---|
+    | `model_type` | string | **required** | **required** | **required** | **required** |
+    | `prompt` | string | `""` | `""` | `""` | `""` |
+    | `negative_prompt` | string | `""` | `""` | `""` | `""` |
+    | `resolution` | string | `"1280x720"` | `"1280x720"` | `"1280x720"` | `"1280x720"` |
+    | `video_length` | int (`8n+1`) | `241` | `241` | `241` | `241` |
+    | `num_inference_steps` | int | `30` | `50` | **locked to `8`** | `40` |
+    | `seed` | int | `-1` (random) | `-1` | `-1` | `-1` |
+    | `guidance_scale` | float | `3.0` | `3.0` | forced `1.0` | `3.0` |
+    | `flow_shift` | float | `5.0` | `5.0` | `5.0` | `5.0` |
+
+    ---
+
+    ## Two-stage pipeline parameters (`ltx2_22B`, `ltx2_22B_pure_dev`, `ltx2_22B_keyframe`)
+
+    | Field | Type | Default | Description |
+    |---|---|---|---|
+    | `guidance_phases` | int | `2` (`ltx2_22B`) / `1` (pure_dev) | `1` = dev only; `2` = dev phase then distilled-LoRA phase |
+    | `sample_solver` | string | `"euler"` | `"euler"` · `"res2s"` · `"distilled_8_steps"` (triggers distilled LoRA at phase 2) |
+    | `alt_guidance_scale` | float | `3.0` (forced `1.0` on distilled) | Secondary guidance scale for modality mixing |
+    | `alt_scale` | float | `0.7` (forced `0.0` on distilled) | Guidance rescale factor |
+    | `apg_switch` | int 0/1 | `0` | Adaptive Progressive Guidance — incompatible with `"res2s"` |
+    | `cfg_star_switch` | int 0/1 | `0` | CFG* improved guidance — incompatible with `"res2s"` |
+    | `perturbation_switch` | int | `2` | Skip-Layer Guidance: `0` off · `1` SLG · `2` skip self-attention |
+    | `perturbation_layers` | list[int] | `[28]` | Transformer layer indices for SLG (max 48 layers) |
+    | `perturbation_start_perc` | float | `0` | % of total steps at which SLG activates |
+    | `perturbation_end_perc` | float | `100` | % of total steps at which SLG deactivates |
+    | `NAG_scale` | float | `1.0` | Negative Attention Guidance strength (forced `1.0` when HDR enabled) |
+    | `NAG_tau` | float | `3.5` | NAG temperature |
+    | `NAG_alpha` | float | `0.5` | NAG alpha blending |
+    | `self_refiner_setting` | int | `0` | Self-refinement passes — `0` off |
+    | `self_refiner_plan` | string | `""` | Refinement plan spec (e.g. `"2-8:3"`) |
+    | `self_refiner_f_uncertainty` | float | `0.1` | Uncertainty threshold |
+    | `self_refiner_certain_percentage` | float | `0.999` | Certainty threshold |
+
+    ---
+
+    ## `video_prompt_type` flags
+
+    No auto-defaults on this endpoint. Combine freely (e.g. `"DVG"`, `"PVG"`, `"KI"`).
+
+    | Code | Compound | Meaning | Requires |
+    |---|---|---|---|
+    | `V` | — | Video guide present | `video_guide` |
+    | `A` | — | Mask present | `video_mask` or `image_mask` |
+    | `G` | — | Guide conditioning active (`denoising_strength` < 1 takes effect) | — |
+    | `D` | `DVG` | Depth-map preprocess | union-control LoRA auto-loaded |
+    | `P` | `PVG` | DWPose skeleton preprocess | union-control LoRA auto-loaded |
+    | `O` | `OVG` | Aligned-pose preprocess (aligns to `image_refs` last frame) | union-control LoRA auto-loaded |
+    | `E` | `EVG` | Canny-edge preprocess | union-control LoRA auto-loaded |
+    | `S` | `SVG` | Scribble / shape preprocess | — |
+    | `L` | `LVG` | Optical-flow preprocess | — |
+    | `C` | `CVG` | Grayscale preprocess | — |
+    | `M` | `MVG` | Inpaint-mask preprocess | — |
+    | `U` | `UVG` | Raw passthrough / mask suppressor (with `A`) | — |
+    | `I` | — | Identity reference (all frames attend `image_refs[0]`) | `image_refs` + union-control LoRA |
+    | `K` | — | Keyframe mode — use `ltx2_22B_keyframe` model | `keyframes` array |
+    | `F` | — | Injected frames at explicit positions | `image_refs` + `frames_positions` |
+    | `Y` | — | Depth outside mask (requires `A`) | — |
+    | `W` | — | Scribble outside mask (requires `A`) | — |
+    | `X` | — | Inpaint fill outside mask (requires `A`) | — |
+    | `Z` | — | Optical flow outside mask (requires `A`) | — |
+    | `&` | — | HDR output (LogC3 compression) | HDR `video_guide`; `ltx2_22B` only |
+
+    > ⚠️ `"G"` alone discards `video_guide` and forces full t2v. Always combine: `"DVG"`, `"VG"`, etc.
+
+    ---
+
+    ## Video conditioning parameters
+
+    | Field | Type | Default | Description |
+    |---|---|---|---|
+    | `video_guide` | file-ref | `null` | Control video — upload with `POST /files/upload` |
+    | `video_prompt_type` | string | `""` | Processing flags (see table above) |
+    | `denoising_strength` | float 0–1 | `1.0` | **LTX-2 v2v**: higher = output **closer** to guide (opposite of img2img) |
+    | `video_mask` | file-ref | `null` | Binary mask video: white = regenerate, black = keep |
+    | `masking_strength` | float 0–1 | `0.0` | Mask reinjection strength per step |
+    | `mask_expand` | int | `0` | Pixels to expand mask boundary |
+    | `keep_frames_video_guide` | string | `""` | Frame range to use from guide, e.g. `"5:-1"` blanks first 5 frames |
+    | `frames_positions` | string | `""` | 1-indexed positions for `F` injection, e.g. `"1 5 10 L"` |
+
+    ## `image_prompt_type` flags
+
+    | Code | Meaning | Requires |
+    |---|---|---|
+    | `S` | Pin frame 0 to `image_start` (pixel-exact) | `image_start` |
+    | `E` | Guide last frame toward `image_end` | `image_end` |
+    | `V` | Source video present | `video_source` |
+    | `L` | Continue from last generated video | — |
+
+    ## Image conditioning parameters
+
+    | Field | Type | Default | Description |
+    |---|---|---|---|
+    | `image_start` | file-ref | `null` | Start frame — requires `"S"` in `image_prompt_type` |
+    | `image_end` | file-ref | `null` | End frame — requires `"E"` in `image_prompt_type` |
+    | `image_refs` | list[file-ref] | `null` | Reference images for `"I"` (identity) or `"KI"` / `"FI"` modes |
+    | `image_prompt_type` | string | `""` | Image flags: `"S"`, `"E"`, `"V"`, `"L"` |
+    | `remove_background_images_ref` | int 0/1 | `1` | Strip background from `image_refs` before encoding |
+    | `keyframes` | list | `null` | `[[file_ref, frame_idx_0based, strength], …]` for `ltx2_22B_keyframe` |
+
+    ## `audio_prompt_type` flags
+
+    | Code | Meaning | Notes |
+    |---|---|---|
+    | `A` | Audio source → cross-attention conditioning | `audio_guide` or `audio_source` |
+    | `K` | Use audio from `video_guide` | — |
+    | `O` | Force audio in output | — |
+    | `1` | ID-LoRA speaker identity | auto-loads `id-lora-celebvhq-ltx2.safetensors` |
+    | `2` | Generate audio from video | distilled + `VG` only; forbids D/P/O/E/&/A/F/K/I |
+
+    ## Audio parameters
+
+    | Field | Type | Default | Description |
+    |---|---|---|---|
+    | `audio_guide` | file-ref | `null` | Primary audio for conditioning |
+    | `audio_source` | file-ref | `null` | Custom audio to remux into output |
+    | `audio_prompt_type` | string | `""` | Audio flags |
+    | `audio_scale` | float | `1.0` | Audio prompt weight |
+    | `audio_guidance_scale` | float | `7.0` (`1.0` on distilled) | Audio conditioning strength |
+
+    ## LoRA parameters
+
+    | Field | Type | Default | Description |
+    |---|---|---|---|
+    | `activated_loras` | list[string] | `[]` | LoRA filenames from the `loras/ltx2/` directory |
+    | `loras_multipliers` | string | `""` | Space-separated multipliers, one per entry in `activated_loras` |
+
+    Auto-loaded LoRAs (additive to `activated_loras`):
+
+    | Condition | LoRA |
+    |---|---|
+    | D/P/O/E or `I` in `video_prompt_type` | `ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors` |
+    | `guidance_phases=2` or `sample_solver="distilled_8_steps"` | `ltx-2.3-22b-distilled-lora-384-1.1.safetensors` |
+    | `&` in `video_prompt_type` | `ltx-2.3-22b-ic-lora-hdr-0.9.safetensors` |
+    | `1` in `audio_prompt_type` | `id-lora-celebvhq-ltx2.safetensors` |
+
+    ## Sliding window (long video)
+
+    | Field | Type | Default | Description |
+    |---|---|---|---|
+    | `sliding_window_size` | int | `481` | Window size in frames (min 5, max 501, step 4) |
+    | `sliding_window_overlap` | int | `17` | Frame overlap between windows (min 1, max 97, step 8) |
+    | `sliding_window_color_correction_strength` | float 0–1 | `0` | Color correction at window boundaries |
+    | `sliding_window_overlap_noise` | float 0–1 | `0` | Noise in overlap region for smoother blending |
+    | `sliding_window_discard_last_frames` | int | `0` | Frames to discard at end of each window |
+
+    ---
+
+    ## Incompatibility rules
+
+    | Constraint |
+    |---|
+    | `"2"` (audio-gen) requires `"VG"`, forbids D/P/O/E/&/A/F/K/I |
+    | `"&"` (HDR) requires `ltx2_22B`, forbids D/P/O/E, outpainting, and `"F"` |
+    | `"I"` requires exactly one entry in `image_refs` unless `"K"` or `"F"` is also present |
+    | `"O"` (aligned pose) + mask: outside-mask processing disabled |
+    | Distilled variants: `guidance_scale` forced `1.0`; `alt_guidance_scale` forced `1.0`; `alt_scale` forced `0.0` |
+    | `apg_switch=1` or `cfg_star_switch=1` incompatible with `sample_solver="res2s"` |
+
+    ---
+
+    ## Payload examples
+
+    ### 1 — Text-to-video (fastest)
+    ```json
+    {
+      "settings": {
+        "model_type": "ltx2_22B_distilled",
+        "prompt": "A red fox running through a snowy forest at dawn, cinematic",
+        "negative_prompt": "blurry, low quality, watermark",
+        "resolution": "1280x720",
+        "video_length": 97,
+        "num_inference_steps": 8,
+        "guidance_scale": 1.0,
+        "seed": 42
+      }
+    }
+    ```
+
+    ### 2 — Image-to-video (start frame pinned)
+    ```json
+    {
+      "settings": {
+        "model_type": "ltx2_22B_distilled",
+        "prompt": "The woman smiles and turns her head slowly",
+        "image_start": "file:<file_id>",
+        "image_prompt_type": "S",
+        "resolution": "832x480",
+        "video_length": 97,
+        "num_inference_steps": 8
+      }
+    }
+    ```
+
+    ### 3 — Image-to-video (start + end frames)
+    ```json
+    {
+      "settings": {
+        "model_type": "ltx2_22B",
+        "prompt": "Smooth cinematic transition between two scenes",
+        "image_start": "file:<file_id_start>",
+        "image_end":   "file:<file_id_end>",
+        "image_prompt_type": "SE",
+        "resolution": "1280x720",
+        "video_length": 97,
+        "num_inference_steps": 30,
+        "guidance_scale": 3.0,
+        "guidance_phases": 2,
+        "sample_solver": "distilled_8_steps"
+      }
+    }
+    ```
+
+    ### 4 — Video-to-video with depth conditioning
+    ```json
+    {
+      "settings": {
+        "model_type": "ltx2_22B_distilled",
+        "prompt": "Same scene but at night, neon lights reflecting on wet pavement",
+        "video_guide": "file:<file_id>",
+        "video_prompt_type": "DVG",
+        "denoising_strength": 0.8,
+        "resolution": "1280x720",
+        "video_length": 97,
+        "num_inference_steps": 8,
+        "activated_loras": ["ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"],
+        "loras_multipliers": "1"
+      }
+    }
+    ```
+
+    ### 5 — Video-to-video with pose transfer
+    ```json
+    {
+      "settings": {
+        "model_type": "ltx2_22B_distilled",
+        "prompt": "A dancer in a red dress performing the same choreography",
+        "video_guide": "file:<file_id>",
+        "video_prompt_type": "PVG",
+        "denoising_strength": 0.75,
+        "resolution": "832x480",
+        "video_length": 97,
+        "num_inference_steps": 8,
+        "activated_loras": ["ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"],
+        "loras_multipliers": "1"
+      }
+    }
+    ```
+
+    ### 6 — V2V with start frame and transition smoothing
+    ```json
+    {
+      "settings": {
+        "model_type": "ltx2_22B_distilled",
+        "prompt": "Same scene stylized as a watercolour painting",
+        "video_guide":  "file:<guide_file_id>",
+        "image_start":  "file:<start_frame_file_id>",
+        "video_prompt_type": "DVG",
+        "image_prompt_type": "S",
+        "denoising_strength": 0.8,
+        "keep_frames_video_guide": "17:-1",
+        "resolution": "1280x720",
+        "video_length": 97,
+        "num_inference_steps": 8,
+        "activated_loras": ["ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"],
+        "loras_multipliers": "1"
+      }
+    }
+    ```
+
+    ### 7 — Identity reference conditioning (`"I"` mode)
+    ```json
+    {
+      "settings": {
+        "model_type": "ltx2_22B",
+        "prompt": "A woman walking through a park, cinematic, soft light",
+        "negative_prompt": "blurry, low quality",
+        "video_prompt_type": "I",
+        "image_refs": ["file:<ref_photo_file_id>"],
+        "remove_background_images_ref": 1,
+        "activated_loras": ["ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"],
+        "loras_multipliers": "1",
+        "video_length": 97,
+        "resolution": "832x480",
+        "num_inference_steps": 8,
+        "guidance_phases": 2,
+        "sample_solver": "distilled_8_steps",
+        "guidance_scale": 1.0,
+        "seed": 42
+      }
+    }
+    ```
+
+    ### 8 — Keyframe interpolation
+    ```json
+    {
+      "settings": {
+        "model_type": "ltx2_22B_keyframe",
+        "prompt": "A smooth cinematic transition through an autumn forest",
+        "video_length": 121,
+        "resolution": "1280x720",
+        "num_inference_steps": 40,
+        "seed": 42,
+        "keyframes": [
+          ["file:<fid_frame0>",   0, 1.0],
+          ["file:<fid_frame60>", 60, 1.0],
+          ["file:<fid_frame120>", 120, 1.0]
+        ]
+      }
+    }
+    ```
+
+    ### 9 — Long video with sliding window
+    ```json
+    {
+      "settings": {
+        "model_type": "ltx2_22B_distilled",
+        "prompt": "An epic aerial journey over mountain ranges, cinematic 4K",
+        "resolution": "1280x720",
+        "video_length": 481,
+        "num_inference_steps": 8,
+        "sliding_window_size": 97,
+        "sliding_window_overlap": 17,
+        "sliding_window_color_correction_strength": 0.5,
+        "seed": 7
+      }
+    }
+    ```
+
+    ### 10 — HDR video-to-video (`ltx2_22B` only)
+    ```json
+    {
+      "settings": {
+        "model_type": "ltx2_22B",
+        "prompt": "Transform the scene into a vibrant HDR sunset",
+        "video_guide": "file:<hdr_source_file_id>",
+        "video_prompt_type": "&VG",
+        "denoising_strength": 0.85,
+        "resolution": "1280x720",
+        "video_length": 97,
+        "num_inference_steps": 30,
+        "guidance_scale": 3.0,
+        "guidance_phases": 1
+      }
+    }
+    ```
+
+    ### 11 — High quality dev (no distilled LoRA)
+    ```json
+    {
+      "settings": {
+        "model_type": "ltx2_22B_pure_dev",
+        "prompt": "A majestic eagle soaring over a glacier, ultra-detailed feathers",
+        "negative_prompt": "blurry, artifacts, compression",
+        "resolution": "1280x720",
+        "video_length": 97,
+        "num_inference_steps": 50,
+        "guidance_scale": 3.0,
+        "guidance_phases": 1,
+        "perturbation_switch": 2,
+        "perturbation_layers": [28],
+        "seed": 123
+      }
+    }
+    ```
+
+    ### 12 — Masked inpainting (regenerate inside mask only)
+    ```json
+    {
+      "settings": {
+        "model_type": "ltx2_22B_distilled",
+        "prompt": "Replace the background with a tropical beach at sunset",
+        "video_guide": "file:<source_video_file_id>",
+        "video_mask":  "file:<mask_video_file_id>",
+        "video_prompt_type": "DVA",
+        "denoising_strength": 0.9,
+        "masking_strength": 1.0,
+        "resolution": "1280x720",
+        "video_length": 97,
+        "num_inference_steps": 8,
+        "activated_loras": ["ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"],
+        "loras_multipliers": "1"
+      }
+    }
+    ```
+
+    ---
+
+    **Response** (HTTP 202) — `job_id`, `status`, `queue_position`, `poll_url`
+
+    **Errors** — `400` `model_type` missing · `503` queue full (`WANGP_MAX_QUEUE`)
+    """
+    if "model_type" not in body.settings:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "validation_error", "message": "model_type is required"},
+        )
+    _log_settings(body.settings)
+    return _enqueue_settings(body.settings)
+
+
+@app.get("/jobs/{job_id}", summary="Poll job status", tags=["Jobs"])
 async def get_job(job_id: str, request: Request, _: None = Depends(_check_api_key)) -> dict:
     """Return the current status and result of a generation job.
 
@@ -695,7 +1256,7 @@ async def get_job(job_id: str, request: Request, _: None = Depends(_check_api_ke
     return resp
 
 
-@app.delete("/jobs/{job_id}", summary="Cancel a job")
+@app.delete("/jobs/{job_id}", summary="Cancel a job", tags=["Jobs"])
 async def cancel_job(job_id: str) -> dict:
     """Request cancellation of a queued or running job.
 
@@ -730,7 +1291,7 @@ async def cancel_job(job_id: str) -> dict:
     return {"job_id": job_id, "status": "cancelling"}
 
 
-@app.get("/jobs/{job_id}/events", summary="Stream job events (SSE)")
+@app.get("/jobs/{job_id}/events", summary="Stream job events (SSE)", tags=["Jobs"])
 async def job_events(job_id: str, request: Request, _: None = Depends(_check_api_key)):
     """Stream real-time generation events as Server-Sent Events (SSE).
 
@@ -788,7 +1349,7 @@ async def job_events(job_id: str, request: Request, _: None = Depends(_check_api
     )
 
 
-@app.get("/files/{filename}", summary="Download a generated file")
+@app.get("/files/{filename}", summary="Download a generated file", tags=["Files"])
 async def download_file(filename: str) -> FileResponse:
     """Download a file produced by a completed generation job.
 
