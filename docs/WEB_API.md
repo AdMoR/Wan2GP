@@ -178,6 +178,127 @@ No distilled LoRA is injected — you get the raw dev-model output.  The tradeof
 more inference steps (~50 vs ~30) but no LoRA overhead and no distillation artifacts.
 Use it when quality matters more than speed, or when you want to avoid any LoRA interference.
 
+#### MiniMax H3 (video **and** native stereo audio)
+
+MiniMax H3 generates a video together with a synchronized 32 kHz stereo soundtrack
+in a single pass, so a completed job returns a video file that already carries its
+audio — no audio remux step is needed.
+
+| `model_type` | Mode | Size | Inputs |
+|---|---|---|---|
+| `minimax_h3_fl2va` | First/Last-frame → video+audio | 33B | text, `image_start`, `image_end` |
+| `minimax_h3_fl2va_pruned` | same | 20B | same |
+| `minimax_h3_ref2va` | Reference → video+audio | 33B | text + reference images / videos / audio |
+| `minimax_h3_ref2va_pruned` | same | 20B | same |
+
+The *pruned* checkpoints replace the AdaLN timestep projections with precomputed
+low-rank modulation curves; they accept exactly the same settings as their 33B
+counterparts and are the cheapest way to smoke-test the family.
+
+##### Common constraints (both variants)
+
+| Setting | Value | Why |
+|---|---|---|
+| `video_length` | `107 + 17·n` → 107, 124, 141, … | `frames_minimum=107`, `frames_steps=17`, `frames_offset=5`. Out-of-grid values are rounded down. |
+| `resolution` | both dimensions multiples of 32 | `block_size = 32` |
+| `guidance_scale` | `1.0` | H3 has `guidance_max_phases = 0` — CFG is not used |
+| `sample_solver` | `"euler"` | the only solver H3 exposes |
+| `num_inference_steps` | ~20 | |
+| `flow_shift` | `12.0` | model default |
+| output fps | 24 (fixed) | 4–15 s is the officially documented output range |
+
+Optional speed/memory knobs:
+
+- `skip_steps_cache_type: "spectrum"` + `skip_steps_start_step_perc: 25` — Spectrum
+  Feature Forecasting, the only step-skipping type H3 accepts (any other value raises).
+- Text-encoder quantization (Qwen3-VL 32B) is a *model configuration*, not a job
+  setting — pick it once in the UI / model definition (`bf16`, `int8`, `nvfp4_awq`,
+  `gguf_q4_k_m`, `gguf_q2_k`) rather than per request.
+
+##### FL2VA — first / last frame
+
+`image_prompt_type` accepts `T` (text only), `S` (start image), `E` (end image),
+`SE` (both), plus `V`/`L` for continuation. Boundary images are timeline positions,
+**not** identity references — use Ref2VA for those.
+
+FL2VA is a sliding-window model: window size must be ≥ 124 and the handler ties it
+to `video_length` for single-window jobs, so pass `sliding_window_size` equal to
+`video_length` (and `sliding_window_overlap: 1`) unless you deliberately want
+multi-window generation (`window_max` 481, `window_step` 17).
+
+```json
+{
+  "settings": {
+    "model_type": "minimax_h3_fl2va_pruned",
+    "prompt": "A cinematic close-up of a jazz duo in a softly lit club; the singer delivers a warm intimate line, natural lip motion, realistic room acoustics.",
+    "resolution": "832x480",
+    "video_length": 124,
+    "sliding_window_size": 124,
+    "sliding_window_overlap": 1,
+    "num_inference_steps": 20,
+    "guidance_scale": 1.0,
+    "flow_shift": 12.0,
+    "sample_solver": "euler",
+    "image_prompt_type": "S",
+    "image_start": "file:upload_1714500000_a3f7c2b1"
+  }
+}
+```
+
+##### Ref2VA — image / video / audio references
+
+Ref2VA runs a single pass (no sliding window; the server-side validator zeroes all
+sliding-window fields for you). At least one reference is **required** — a job with
+none is rejected.
+
+| Flag field | Value | Meaning | Attachment |
+|---|---|---|---|
+| `video_prompt_type` | `""` | no reference video | — |
+| | `"VG"` | one reference video | `video_guide` |
+| | `"V+G"` | two reference videos | `video_guide`, `video_guide2` |
+| `audio_prompt_type` | `""` | no reference audio | — |
+| | `"A"` | one audio reference | `audio_guide` |
+| | `"AB"` | two audio references | `audio_guide`, `audio_guide2` |
+| | `"K"` | reuse the reference videos' soundtracks | — |
+| `video_prompt_type` | `"I"` | use reference images | `image_refs` (list) |
+
+> **Set `video_prompt_type` explicitly.** When `video_guide` is present and the field
+> is omitted, the server defaults it to `"DVG"` (LTX-2 depth-map conditioning), which
+> is wrong for H3. Send `"VG"` / `"V+G"`, adding `"I"` when you also pass `image_refs`.
+
+Validation rules enforced before the job runs (violations return an error instead of
+a bad generation):
+
+- ≤ 9 reference images.
+- ≤ 2 reference videos; each 2–15 s, **15 s total**.
+- ≤ 2 audio references; each 2–15 s, **15 s total**.
+- `audio references ≤ images + videos` — audio always needs matching visual references.
+- ≤ 12 reference files overall. `"K"` (video soundtracks) consumes an audio slot per
+  selected video but no extra file.
+- `"K"` requires every reference video to actually have an audio track.
+
+```json
+{
+  "settings": {
+    "model_type": "minimax_h3_ref2va_pruned",
+    "prompt": "The referenced performer sings on a softly lit stage, preserving identity, costume and voice; natural lip motion, realistic room acoustics.",
+    "resolution": "832x480",
+    "video_length": 124,
+    "num_inference_steps": 20,
+    "guidance_scale": 1.0,
+    "flow_shift": 12.0,
+    "sample_solver": "euler",
+    "video_prompt_type": "I",
+    "image_refs": ["file:upload_1714500000_a3f7c2b1"],
+    "audio_prompt_type": "A",
+    "audio_guide": "file:upload_1714500000_d4b8e1c9"
+  }
+}
+```
+
+A ready-to-run client for both variants (submit → SSE progress → download) lives in
+[`test_server_minimax_h3.py`](../test_server_minimax_h3.py) at the repo root.
+
 #### Video duration
 
 Use **`video_length`** (not `num_frames` or `duration`) to control the number of
@@ -1108,6 +1229,12 @@ curl -s -X POST http://localhost:8082/jobs \
   -H "Content-Type: application/json" \
   -H "X-API-Key: my-secret" \
   -d "{\"settings\": {\"model_type\": \"ltx2_22B\", \"prompt\": \"a woman walking through a park\", \"video_prompt_type\": \"I\", \"image_refs\": [\"file:$REF_ID\"], \"remove_background_images_ref\": 1, \"activated_loras\": [\"ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors\"], \"loras_multipliers\": \"1\", \"video_length\": 97, \"resolution\": \"832x480\", \"sample_solver\": \"distilled_8_steps\", \"num_inference_steps\": 8, \"guidance_phases\": 2}}"
+
+# Submit a MiniMax H3 job (video + native stereo audio)
+curl -s -X POST http://localhost:8082/jobs \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: my-secret" \
+  -d '{"settings": {"model_type": "minimax_h3_fl2va_pruned", "prompt": "a jazz duo performing in a softly lit club", "resolution": "832x480", "video_length": 124, "sliding_window_size": 124, "sliding_window_overlap": 1, "num_inference_steps": 20, "guidance_scale": 1.0, "flow_shift": 12.0, "sample_solver": "euler"}}'
 
 # Poll status
 curl -s http://localhost:8082/jobs/job_1714500000_b9e2d4f0 \

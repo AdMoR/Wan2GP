@@ -125,6 +125,17 @@ RUN git clone --recursive https://github.com/dmlc/decord /tmp/decord && \
     make -j$(nproc) && \
     cd /tmp/decord/python && python3 setup.py install
 RUN echo "coucou"
+
+# The ffmpeg 4.4.4 built above is required for decord's shared libs
+# (libavcodec.so etc under /usr/lib) — keep those in place. But the ffmpeg
+# *CLI* is too old to support flags like -fps_mode (added in ffmpeg 5),
+# which wangp's own video-guide decoding step relies on. imageio-ffmpeg
+# (already in requirements.txt) bundles a modern static ffmpeg binary for
+# this platform — repoint /usr/bin/ffmpeg at it without touching the
+# decord-linked shared libraries.
+RUN FFMPEG_NEW=$(python3 -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())') && \
+    mv /usr/bin/ffmpeg /usr/bin/ffmpeg.decord-4.4.4 && \
+    ln -s "$FFMPEG_NEW" /usr/bin/ffmpeg
 COPY --chown=user:user . .
 COPY --chown=user:user entrypoint.sh /workspace/entrypoint.sh
 COPY --chown=user:user wangp_server.py /workspace/wangp_server.py
