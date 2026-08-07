@@ -184,16 +184,38 @@ MiniMax H3 generates a video together with a synchronized 32 kHz stereo soundtra
 in a single pass, so a completed job returns a video file that already carries its
 audio — no audio remux step is needed.
 
-| `model_type` | Mode | Size | Inputs |
-|---|---|---|---|
-| `minimax_h3_fl2va` | First/Last-frame → video+audio | 33B | text, `image_start`, `image_end` |
-| `minimax_h3_fl2va_pruned` | same | 20B | same |
-| `minimax_h3_ref2va` | Reference → video+audio | 33B | text + reference images / videos / audio |
-| `minimax_h3_ref2va_pruned` | same | 20B | same |
+##### Choosing the model
 
-The *pruned* checkpoints replace the AdaLN timestep projections with precomputed
-low-rank modulation curves; they accept exactly the same settings as their 33B
-counterparts and are the cheapest way to smoke-test the family.
+There are exactly four `model_type` values — two families × two sizes:
+
+| `model_type` | UI name | Size | Use it when you have… |
+|---|---|---|---|
+| `minimax_h3_fl2va` | MiniMax H3 FL2VA 33B | 33B | text only, `image_start`, `image_end`, or both |
+| `minimax_h3_fl2va_pruned` | MiniMax H3 FL2VA Pruned 20B | 20B | same, cheaper |
+| `minimax_h3_ref2va` | MiniMax H3 Ref2VA 33B | 33B | `image_refs`, `video_guide` / `video_guide2`, `audio_guide` / `audio_guide2` |
+| `minimax_h3_ref2va_pruned` | MiniMax H3 Ref2VA Pruned 20B | 20B | same, cheaper |
+
+**The family choice (FL2VA vs Ref2VA) is decided by your inputs, and it is enforced —
+not advisory.** Sending an input to the wrong family fails the job (see
+[Checkpoint / input mismatch errors](#checkpoint--input-mismatch-errors) below):
+
+| What you have | Family |
+|---|---|
+| `image_start` / `image_end` (boundary frames — timeline positions, not identity) | **FL2VA only** |
+| `image_refs`, a control/reference video, or `"A"` in `audio_prompt_type` | **Ref2VA only** |
+| Your own audio to drive the soundtrack | **Ref2VA only** — FL2VA ignores `input_waveform`; its audio is always generated |
+| Sliding-window continuation for clips beyond one window | **FL2VA only** — Ref2VA is single-pass |
+| Text prompt only | either family |
+
+**The size choice (33B vs `_pruned` 20B) is free.** The pruned checkpoints replace the
+AdaLN timestep projections with precomputed low-rank modulation curves; they accept
+exactly the same settings as their 33B counterparts, so you can switch between them
+without touching any other parameter. They are the cheapest way to smoke-test the
+family.
+
+Orthogonal to all four: the Qwen3-VL 32B text-encoder quantization (`bf16`, `int8`,
+`nvfp4_awq`, `gguf_q4_k_m`, `gguf_q2_k`) is a model *configuration*, not a
+`model_type` — the same four names apply whichever you pick.
 
 ##### Common constraints (both variants)
 
@@ -295,6 +317,46 @@ a bad generation):
   }
 }
 ```
+
+##### Checkpoint / input mismatch errors
+
+The two variants are not interchangeable: each pipeline rejects inputs the loaded
+checkpoint cannot consume, at the start of `generate()` in
+`models/minimax_h3/pipeline.py`, before any sampling happens.
+
+**Sending references to an FL2VA checkpoint:**
+
+```
+ValueError: Image, video, and audio references require the Ref2VA checkpoint
+```
+
+Raised when `model_type` is `minimax_h3_fl2va` / `minimax_h3_fl2va_pruned` and *any*
+of the following is present in the request:
+
+- a non-empty `image_refs` list,
+- an `input_frames` / control-video attachment,
+- `"A"` in `audio_prompt_type`.
+
+FL2VA only accepts start/end-frame conditioning (`image_start`, `image_end`) and
+continuation frames; it has no reference-encoding path. It also ignores
+`input_waveform` — on FL2VA the soundtrack is always model-generated, never driven by
+audio you supply.
+
+**Sending boundary images to a Ref2VA checkpoint:**
+
+```
+ValueError: First/last-frame conditioning requires the FL2VA checkpoint
+```
+
+Raised when `model_type` is `minimax_h3_ref2va` / `minimax_h3_ref2va_pruned` and
+`image_start` or `image_end` is set. Ref2VA exposes `image_prompt_types_allowed: "T"`
+only — pass identity material through `image_refs` with `"I"` instead.
+
+To fix either one, pick the matching checkpoint for the inputs you actually want, or
+clear the offending fields. The most common cause is **carried-over settings**: a
+saved settings file or reused request body from the other variant still carrying
+`image_refs` / `audio_prompt_type` / `image_start`. The API does not silently drop
+these fields — it fails the job so the mismatch is visible.
 
 A ready-to-run client for both variants (submit → SSE progress → download) lives in
 [`test_server_minimax_h3.py`](../test_server_minimax_h3.py) at the repo root.
