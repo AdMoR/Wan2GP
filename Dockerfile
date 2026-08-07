@@ -56,6 +56,20 @@ COPY requirements.txt .
 # Remove decord from requirements — we build it from source below
 RUN sed -i '/decord/Id' requirements.txt
 
+# aarch64 (GB10/Grace-Blackwell) pin relaxations.
+# torchcodec only started publishing linux_aarch64 wheels at 0.11; the pinned
+# 0.10.0 is x86-only, and the right build has to track the torch version that
+# the cu130 index resolves to anyway. Unpin and let pip match.
+#
+# onnxruntime-gpu is pinned to a dated nightly that the ort-cuda-13-nightly feed
+# has since pruned, so the pin is unsatisfiable on any arch now. Move to the
+# stable 1.26.0 release that the same feed still carries.
+RUN if [ "$(uname -m)" = "aarch64" ]; then \
+        sed -i 's/^torchcodec==.*/torchcodec/' requirements.txt && \
+        sed -i 's/^onnxruntime-gpu==1\.25\.0\.dev[0-9]*/onnxruntime-gpu==1.26.0/' requirements.txt && \
+        sed -i '/^taichi/d' requirements.txt; \
+    fi
+
 # First install torch with the versions we want, so that stuff in requirements.txt doesn't pull in the generic versions
 # If you change CUDA 12.8 here, you also need to change the FROM docker image at the top
 RUN python3 -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130 --break-system-packages
