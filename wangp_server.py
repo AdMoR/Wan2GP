@@ -661,6 +661,145 @@ def _enqueue_settings(settings: dict[str, Any]) -> dict:
     }
 
 
+H3_MODEL_TYPES = (
+    "minimax_h3_fl2va",
+    "minimax_h3_fl2va_pruned",
+    "minimax_h3_ref2va",
+    "minimax_h3_ref2va_pruned",
+)
+H3_REF_MODEL_TYPES = ("minimax_h3_ref2va", "minimax_h3_ref2va_pruned")
+
+# Mirrors FIRST_BLOCK_CACHE_THRESHOLDS in models/minimax_h3/minimax_h3_handler.py.
+# validate_settings rejects any other value when skip_steps_cache_type="first_block".
+H3_FIRST_BLOCK_CACHE_THRESHOLDS = (0.06, 0.08, 0.10, 0.12, 0.14)
+H3_SKIP_STEPS_CACHE_TYPES = ("", "spectrum", "first_block")
+
+# "config" encodes the model's system_configs groups as a comma-joined selection:
+#   "<text_encoder>,<video_vae>,<dit_priority>,<finetune>"
+H3_TEXT_ENCODERS = ("", "bf16", "int8", "nvfp4_awq", "gguf_q4_k_m", "gguf_q2_k")
+H3_VIDEO_VAES = ("", "fp8mix")
+H3_DIT_PRIORITIES = ("", "lower_ram")
+
+# Control/reference video modes accepted by the ref2va guide_custom_choices,
+# keyed by the API-friendly alias callers pass as `control_video_mode`.
+H3_CONTROL_VIDEO_MODES = {
+    "none": "",
+    "reference": "V-",
+    "reference2": "V+-",
+    "depth": "DV",
+    "generic": "V",
+}
+
+
+def _reject(message: str) -> None:
+    raise HTTPException(
+        status_code=400, detail={"error": "validation_error", "message": message}
+    )
+
+
+def _apply_h3_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    """Validate and normalise the MiniMax H3 (WanGP v12.434) acceleration settings.
+
+    These all pass straight through to the runtime, but WanGP validates them late
+    — a bad value surfaces as a failed job minutes into a run instead of as a 400.
+    This validates them at submission time and expands the API-friendly aliases.
+
+    Step skipping (`skip_steps_cache_type`)
+      - `"first_block"` runs only the first transformer block and reuses the
+        remaining blocks' previous result when little changed. `skip_steps_multiplier`
+        is the *threshold*, one of 0.06/0.08/0.10/0.12/0.14 (0.08 = upstream
+        default). Higher skips more work, trading motion and fine detail.
+      - `"spectrum"` is the alternative mode; the two are mutually exclusive.
+      - `skip_steps_start_step_perc` is when skipping may *begin*, in percent of
+        the generation — not an acceleration factor.
+
+    Sol-Attn (`override_attention="sol"`)
+      Sparse attention over large visual sequences: ~10-20% on RTX 40-series,
+      ~30% on RTX 50-series, with a possible small quality trade-off. Requires
+      BF16, Triton 3.6+ and a compatible NVIDIA GPU (RTX 40/50, H100/H200,
+      B100/B200). Combinable with either step-skipping mode for an extra push.
+
+    Video VAE / text encoder / DiT priority (`config`)
+      Callers may pass the `config` string directly, or the friendlier
+      `video_vae="fp8mix"` (lower-RAM quantised VAE), `text_encoder=...` and
+      `dit_priority="lower_ram"` keys, which are merged into `config` here.
+
+    Reference-image pixel budget (`image_refs_relative_size`, ref2va only)
+      50-400%: lower is faster, 100% matches the output video's pixel budget,
+      higher favours reference fidelity. Defaults to 100 rather than the
+      original implementation's unbounded native resolution, which could feed
+      a 4K reference into a 480p generation.
+
+    Control video (`control_video_mode`, ref2va only)
+      Alias expanded into `video_prompt_type`: `reference` / `reference2` reuse
+      subjects, appearance or motion without changing the output size; `depth`
+      guides scene depth and layout; `generic` feeds the clip directly to H3.
+      Control videos define the output canvas, reference videos do not.
+    """
+    model_type = settings.get("model_type", "")
+    if model_type not in H3_MODEL_TYPES:
+        return settings
+    s = dict(settings)
+    is_ref = model_type in H3_REF_MODEL_TYPES
+
+    cache_type = s.get("skip_steps_cache_type", "")
+    if cache_type not in H3_SKIP_STEPS_CACHE_TYPES:
+        _reject(
+            f"skip_steps_cache_type must be one of {H3_SKIP_STEPS_CACHE_TYPES} for {model_type}"
+        )
+    if cache_type == "first_block":
+        threshold = float(s.get("skip_steps_multiplier", 0.08))
+        if threshold not in H3_FIRST_BLOCK_CACHE_THRESHOLDS:
+            _reject(
+                "skip_steps_multiplier (First Block Cache threshold) must be one of "
+                f"{H3_FIRST_BLOCK_CACHE_THRESHOLDS}, got {threshold}"
+            )
+        s["skip_steps_multiplier"] = threshold
+
+    override_attention = s.get("override_attention", "")
+    if override_attention not in ("", "sol"):
+        _reject('override_attention must be "" or "sol"')
+
+    # Merge the friendly config aliases into the comma-joined `config` selection.
+    text_encoder = s.pop("text_encoder", None)
+    video_vae = s.pop("video_vae", None)
+    dit_priority = s.pop("dit_priority", None)
+    if any(v is not None for v in (text_encoder, video_vae, dit_priority)):
+        current = (str(s.get("config", "")).split(",") + [""] * 4)[:4]
+        for index, (value, allowed, name) in enumerate((
+            (text_encoder, H3_TEXT_ENCODERS, "text_encoder"),
+            (video_vae, H3_VIDEO_VAES, "video_vae"),
+            (dit_priority, H3_DIT_PRIORITIES, "dit_priority"),
+        )):
+            if value is None:
+                continue
+            if value not in allowed:
+                _reject(f"{name} must be one of {allowed}, got {value!r}")
+            current[index] = value
+        s["config"] = ",".join(current).rstrip(",")
+
+    if "image_refs_relative_size" in s:
+        if not is_ref:
+            _reject(f"image_refs_relative_size is only supported by {H3_REF_MODEL_TYPES}")
+        size = int(s["image_refs_relative_size"])
+        if not 50 <= size <= 400:
+            _reject(f"image_refs_relative_size must be between 50 and 400, got {size}")
+        s["image_refs_relative_size"] = size
+    elif is_ref and s.get("image_refs"):
+        s["image_refs_relative_size"] = 100
+
+    mode = s.pop("control_video_mode", None)
+    if mode is not None:
+        if not is_ref:
+            _reject(f"control_video_mode is only supported by {H3_REF_MODEL_TYPES}")
+        if mode not in H3_CONTROL_VIDEO_MODES:
+            _reject(
+                f"control_video_mode must be one of {tuple(H3_CONTROL_VIDEO_MODES)}, got {mode!r}"
+            )
+        s["video_prompt_type"] = H3_CONTROL_VIDEO_MODES[mode]
+    return s
+
+
 def _apply_v2v_settings(settings: dict[str, Any]) -> dict[str, Any]:
     """Normalise settings for video-to-video when video_guide is present.
 
@@ -700,6 +839,10 @@ def _apply_v2v_settings(settings: dict[str, Any]) -> dict[str, Any]:
     keep_frames_video_guide ("{N+1}:-1"). Not supported for model_type="ltxv_13B".
     """
     if not settings.get("video_guide"):
+        return settings
+    # H3 has its own control-video letters ("DV", "V-", "V+-", "V") and no "G"
+    # denoising-strength pathway — _apply_h3_settings owns those flags.
+    if settings.get("model_type", "") in H3_MODEL_TYPES:
         return settings
     s = dict(settings)
     s.setdefault("video_prompt_type", "DVG")
@@ -745,6 +888,44 @@ async def submit_job(body: JobSubmitRequest, _: None = Depends(_check_api_key)) 
     mean the output stays *closer* to the guide video (0.9 = very close,
     0.3 = lightly guided).  This is the opposite of traditional img2img.
 
+    **MiniMax H3** (`minimax_h3_fl2va[_pruned]`, `minimax_h3_ref2va[_pruned]`)
+
+    Accelerators and RAM shrinkers — stack them freely, the gain depends on the
+    video, hardware and settings:
+
+    | Field | Values | Effect |
+    |---|---|---|
+    | `skip_steps_cache_type` | `""`, `"first_block"`, `"spectrum"` | First Block Cache reuses the remaining blocks' previous result when the first block shows little change. Mutually exclusive with Spectrum. |
+    | `skip_steps_multiplier` | `0.06`/`0.08`/`0.10`/`0.12`/`0.14` | First Block Cache threshold; `0.08` is the upstream default. Higher skips more work, possibly trading motion or fine detail. |
+    | `skip_steps_start_step_perc` | `0`–`100` | *When* skipping may begin, in percent of the generation — not an acceleration factor. |
+    | `override_attention` | `""`, `"sol"` | Sol-Attn sparse attention: ~10-20% on RTX 40-series, ~30% on RTX 50-series. Needs BF16, Triton 3.6+, RTX 40/50, H100/H200 or B100/B200. Combines with either step-skipping mode. |
+    | `video_vae` | `""`, `"fp8mix"` | FP8 Mixed Precision Video VAE — less RAM held by VAE weights. |
+    | `text_encoder` | `bf16`, `int8`, `nvfp4_awq`, `gguf_q4_k_m`, `gguf_q2_k` | Text-encoder precision. |
+    | `dit_priority` | `""`, `"lower_ram"` | Trades VRAM for system RAM in DiT denoising. |
+
+    `video_vae`, `text_encoder` and `dit_priority` are conveniences merged into
+    WanGP's comma-joined `config` string, which may also be passed directly.
+
+    W4A8 INT8 checkpoints load as ordinary finetunes (see `docs/FINETUNES.md`):
+    4-bit weights shrink the checkpoint and system RAM, 8-bit activations use
+    INT8 kernels on RTX 30-series or newer.
+
+    Reference variants (`minimax_h3_ref2va[_pruned]`) additionally accept:
+
+    - `image_refs_relative_size` – reference-image pixel budget, `50`–`400`%.
+      Lower is faster, `100` matches the output, higher favours fidelity.
+      Defaults to `100` when `image_refs` is present.
+    - `control_video_mode` – `"reference"` / `"reference2"` (reuse subjects,
+      appearance or motion without changing the output size), `"depth"` (guide
+      scene depth and layout), `"generic"` (feed the clip directly to H3), or
+      `"none"`.  Control videos define the output canvas; reference videos do not.
+      Expands into `video_prompt_type`, which may also be set directly.
+
+    LoRAs load in either pruned or non-pruned format — translation is automatic.
+    The Lightx2v and larryvrh H3 LoRA accelerators ship as predefined profiles;
+    pass them via `activated_loras` with `loras_multipliers` around `0.5`, and
+    raise `num_inference_steps` to 8 if quality suffers.
+
     **Response fields** (202 Accepted)
     - `job_id` – unique job identifier used for status polling and SSE streaming
     - `status` – `"queued"`
@@ -762,7 +943,7 @@ async def submit_job(body: JobSubmitRequest, _: None = Depends(_check_api_key)) 
         )
 
     _log_settings(body.settings)
-    return _enqueue_settings(_apply_v2v_settings(body.settings))
+    return _enqueue_settings(_apply_v2v_settings(_apply_h3_settings(body.settings)))
 
 
 @app.post("/jobs/raw", status_code=202, summary="Submit a generation job (raw — no auto-preprocessing)", tags=["Jobs", "Flag Reference"])

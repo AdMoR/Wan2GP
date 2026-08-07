@@ -31,7 +31,7 @@ Server mode is composed of six distinct layers, each with a single responsibilit
 │     run_cli_job(), _run_tasks_worker(), _handle_command()│
 ├─────────────────────────────────────────────────────────┤
 │  5. WanGP Runtime        wgp.py                         │
-│     validate_task(), load_models(), generate_video()    │
+│     validate_task(), load_models(), generate_media()    │
 ├─────────────────────────────────────────────────────────┤
 │  6. Model Handler & Pipeline                            │
 │     models/<family>/<handler>.py  +  <pipeline>.py      │
@@ -61,7 +61,7 @@ Within a single generation, there are **two threads**:
 - **Main thread** (`run_cli_job`) — holds `_GENERATION_LOCK`, drains the `AsyncStream`
   output queue, dispatches events, handles cancellation checks.
 - **Worker thread** (`_run_tasks_worker`) — calls `wgp.validate_task()` and
-  `wgp.generate_video()` for each task; pushes progress commands onto the `AsyncStream`.
+  `wgp.generate_media()` for each task; pushes progress commands onto the `AsyncStream`.
 
 stdout and stderr are redirected inside the worker thread via `_OutputCapture` wrappers so
 all console output is captured and forwarded as `stream` events.
@@ -91,6 +91,9 @@ Uploaded files are referenced later with `"file:<file_id>"` in any
 ```
 POST /jobs  {"settings": {...}}
   → validate model_type present
+  → _log_settings(settings)
+  → settings = _apply_h3_settings(settings)    MiniMax H3 validation + alias expansion
+  → settings = _apply_v2v_settings(settings)   LTX-2 video-to-video flag repair
   → check queue depth < WANGP_MAX_QUEUE
   → JobState created: status="queued", queue_position=N
   → JobStore.add(job)
@@ -99,6 +102,54 @@ POST /jobs  {"settings": {...}}
 ```
 
 The HTTP response returns immediately.  The job is not yet running.
+
+#### The settings-normalisation layer
+
+Both normalisers are pure `dict → dict` functions in `wangp_server.py`.  They exist
+because `wgp.validate_settings()` runs *inside the worker*, minutes into a run and long
+after the HTTP response has been sent — so a bad flag surfaces as a failed job rather
+than as a `400`.  Each normaliser keys off `settings["model_type"]` and returns the
+input untouched for families it does not own.
+
+`POST /jobs/raw` deliberately skips **both**, passing settings through verbatim for
+callers who want full manual flag control.
+
+**`_apply_h3_settings()`** — MiniMax H3 (`minimax_h3_fl2va[_pruned]`,
+`minimax_h3_ref2va[_pruned]`).  Validates the v12.434 accelerators against constants
+mirrored from `models/minimax_h3/minimax_h3_handler.py`, and expands API-friendly
+aliases into the keys `wgp.generate_media()` actually consumes:
+
+| Caller passes | Becomes | Validated against |
+|---|---|---|
+| `skip_steps_cache_type` | *(unchanged)* | `("", "first_block", "spectrum")` |
+| `skip_steps_multiplier` | *(unchanged)* | `FIRST_BLOCK_CACHE_THRESHOLDS` = `(0.06, 0.08, 0.10, 0.12, 0.14)` |
+| `override_attention` | *(unchanged)* | `("", "sol")` |
+| `text_encoder`, `video_vae`, `dit_priority` | merged into `config` | the model's `system_configs` / `system_configs2` / `system_configs3` group ids |
+| `control_video_mode` | `video_prompt_type` | `guide_custom_choices` letters (`""`, `"V-"`, `"V+-"`, `"DV"`, `"V"`) |
+| `image_refs_relative_size` | *(unchanged, defaults to 100)* | `50`–`400`, ref2va only |
+
+The `config` merge is worth spelling out: WanGP encodes the three system-config groups
+plus a finetune slot as one comma-joined string (see `shared/config_groups.py`,
+`split_config_selection` / `serialize_config_selection`):
+
+```
+config = "<text_encoder>,<video_vae>,<dit_priority>,<finetune>"
+# e.g. video_vae="fp8mix" + text_encoder="int8"  →  config = "int8,fp8mix"
+```
+
+Callers may still set `config` directly; the alias fields are merged on top of whatever
+is already there, and trailing empty slots are stripped.
+
+**`_apply_v2v_settings()`** — LTX-2 video-to-video, triggered by the presence of
+`video_guide`.  Repairs the intuitive-but-wrong `video_source` + `video_prompt_type="G"`
+combination, defaults `video_prompt_type` to `"DVG"` (depth-map conditioning), auto-prepends
+`"S"` when `image_start` is supplied, and converts `transition_frames=N` into
+`keep_frames_video_guide="{N+1}:-1"`.
+
+> **Ordering matters.** `_apply_h3_settings()` runs first, and `_apply_v2v_settings()`
+> returns early for H3 model types.  H3 uses a different control-video alphabet
+> (`"DV"`, `"V-"`, `"V+-"`, `"V"`) and has no `"G"` denoising-strength pathway, so the
+> LTX-2 `"DVG"` default would silently corrupt every H3 control-video job.
 
 ---
 
@@ -198,7 +249,7 @@ _run_tasks_worker(session, wgp, tasks, stream, job, task_summary)
     validated_settings, error = wgp.validate_task(task, session._state)
 ```
 
-**`wgp.validate_task(task, state)`** (`wgp.py:7922`):
+**`wgp.validate_task(task, state)`** (`wgp.py:8391`):
 
 ```
 task["params"] → inputs dict
@@ -224,19 +275,19 @@ A validation failure emits a `GenerationError` with `stage="validation"` and ski
 
 ---
 
-### Step 7 — Worker: `generate_video()` call
+### Step 7 — Worker: `generate_media()` call
 
 ```
 task_settings = validated_settings.copy()
 task_settings["state"] = session._state
 
-expected_args = set(inspect.signature(wgp.generate_video).parameters.keys())
+expected_args = set(inspect.signature(wgp.generate_media).parameters.keys())
 filtered_params = {k: v for k, v in task_settings.items() if k in expected_args}
 
-success = wgp.generate_video(task, send_cmd, plugin_data=plugin_data, **filtered_params)
+success = wgp.generate_media(task, send_cmd, plugin_data=plugin_data, **filtered_params)
 ```
 
-`filtered_params` contains only the keys that `generate_video()` explicitly declares,
+`filtered_params` contains only the keys that `generate_media()` explicitly declares,
 so unknown settings from the client are silently dropped rather than raising `TypeError`.
 
 **`send_cmd(command, data)`** is a closure created per task that pushes items onto the
@@ -254,20 +305,20 @@ so unknown settings from the client are silently dropped rather than raising `Ty
 
 ---
 
-### Step 8 — `generate_video()`: model loading
+### Step 8 — `generate_media()`: model loading
 
-**`wgp.generate_video()`** (`wgp.py:6180`) — the central ~90-parameter generation function,
+**`wgp.generate_media()`** (`wgp.py:6418`) — the central ~90-parameter generation function,
 shared by both the Gradio UI and server mode.
 
 The first thing it does for each request is check whether the right model is already loaded:
 
 ```
-generate_video(task, send_cmd, model_type, ..., state, ...)
+generate_media(task, send_cmd, model_type, ..., state, ...)
   if transformer_type != base_model_type or reload_needed:
       wan_model, offloadobj = load_models(model_type, ...)
 ```
 
-**`load_models(model_type, ...)`** (`wgp.py:3638`):
+**`load_models(model_type, ...)`** (`wgp.py:3909`):
 
 ```
 base_model_type = get_base_model_type(model_type)
@@ -321,7 +372,7 @@ skipped entirely.
 
 Each model family implements a `family_handler` class with a static `load_model()` method.
 
-**Example: LTX-2 handler** (`models/ltx2/ltx2_handler.py:616`):
+**Example: LTX-2 handler** (`models/ltx2/ltx2_handler.py:869`):
 
 ```
 ltx2_handler.family_handler.load_model(
@@ -333,7 +384,7 @@ ltx2_handler.family_handler.load_model(
   ltx2_model = LTX2(
       model_filename, model_type, base_model_type, model_def,
       dtype=..., VAE_dtype=..., checkpoint_paths=...)
-  │   → LTX2.__init__()  (ltx2.py:624)
+  │   → LTX2.__init__()  (ltx2.py:799)
   │       pipeline_kind = model_def.get("ltx2_pipeline", "two_stage")
   │       pipeline_models = self._init_models(...)   loads all weights
   │       if pipeline_kind == "distilled":
@@ -359,12 +410,12 @@ which registers every component for CPU↔GPU lifecycle management.
 
 ---
 
-### Step 10 — `generate_video()`: conditioning & pipeline dispatch
+### Step 10 — `generate_media()`: conditioning & pipeline dispatch
 
-After model loading, `generate_video()` processes all input attachments:
+After model loading, `generate_media()` processes all input attachments:
 
 ```
-generate_video(...)
+generate_media(...)
   # Image / video / audio preprocessing
   image_start_tensor = load_image(image_start)  if present
   src_video = load_video(video_guide, ...)       if present
@@ -386,7 +437,7 @@ generate_video(...)
   )
 ```
 
-**`LTX2.generate()`** (`ltx2.py:943`) — receives the fully-typed inputs and dispatches
+**`LTX2.generate()`** (`ltx2.py:1144`) — receives the fully-typed inputs and dispatches
 to the selected pipeline:
 
 ```
@@ -479,11 +530,87 @@ Decode
 
 The `callback` passed in is called after each denoising step, which triggers a `send_cmd("progress", ...)` and occasionally `send_cmd("preview", ...)` back through the event chain.
 
+#### Where the accelerator settings take effect
+
+The fields normalised in Step 2 are consumed at four different points in the flow, which
+is why an invalid value can fail so late without the submission-time validation:
+
+**Attention override** — `generate_media()` (`wgp.py:6678`), just before generation:
+
+```
+overridden_attention = override_attention or get_overridden_attention(model_type)
+attn = overridden_attention if ... else attention_mode
+if attn not in override_attention_modes_supported:      → send_cmd("info"), send_cmd("exit")
+if attn == "sol" and not model_def["sol_attention"]:    → send_cmd("info"), send_cmd("exit")
+```
+
+Note this path *aborts the job with an info message* rather than raising — an
+unsupported `"sol"` request on a non-Sol GPU ends as a job that produced nothing.
+Sol requires BF16, Triton 3.6+ and RTX 40/50-series, H100/H200 or B100/B200.
+
+**Step-skipping cache** — `generate_media()` (`wgp.py:6914`), built per request and
+attached to the transformer:
+
+```
+skip_steps_cache = DynamicClass(cache_type=skip_steps_cache_type)
+skip_steps_cache.update({
+    "multiplier": skip_steps_multiplier,
+    "start_step": int(skip_steps_start_step_perc * num_inference_steps / 100),
+})
+model_handler.set_cache_parameters(cache_type, base_model_type, model_def, locals(), cache)
+│   minimax_h3_handler: "first_block" → cache.threshold = float(cache.multiplier)
+│                       anything but "spectrum" → raises ValueError
+trans.cache = skip_steps_cache
+```
+
+`start_step` is where `skip_steps_start_step_perc` becomes a concrete step index — it
+selects *when skipping may begin*, and is not an acceleration factor.
+
+**First Block Cache in the H3 pipeline** — `models/minimax_h3/pipeline.py:363`:
+
+```
+first_block_cache = MiniMaxH3FirstBlockCache(cache) if cache.cache_type == "first_block" else None
+for step in steps:
+    first_block_cache.begin_step(step)
+    transformer(video, audio, ..., spectrum=spectrum, first_block_cache=first_block_cache)
+    │   transformer.py:611 — runs the first block, builds a residual signature
+    │   should_compute(signature) → run the remaining blocks + store_tail_residual()
+    │                            → else apply_tail_residual()  (blocks skipped)
+first_block_cache.reset()
+```
+
+The cache holds one tail residual, which is why the VRAM overhead is small.
+
+**System configs (`config`)** — resolved during model loading (Step 8), not at generation
+time.  `load_models()` (`wgp.py:3917`) copies `model_def` and merges each selected group's
+keys into it before the handler sees it:
+
+```
+config_groups = get_model_config_groups(model_type, model_def)
+model_def = model_def.copy()
+for _, _, current_config in selected_model_configs(config_groups, config_id):
+    model_def.update(current_config)
+```
+
+So `video_vae="fp8mix"` rewrites `model_def["video_vae_file"]` to the FP8-mixed
+checkpoint (halving the RAM held by H3's Video VAE weights), and
+`dit_priority="lower_ram"` sets `model_def["qkv_splitting"] = False`.  Because the
+merged `model_def` decides `model_filename`, `config` is part of the reload check in
+`generate_media()` (`wgp.py:6640`):
+
+```
+if model_type != transformer_type or reload_needed or profile != loaded_profile or config != loaded_config:
+    → load_models(...)
+```
+
+Changing any of `text_encoder` / `video_vae` / `dit_priority` between jobs therefore
+forces a full model reload — worth batching jobs by config when driving the queue.
+
 ---
 
 ### Step 12 — Post-processing and output
 
-Back in `generate_video()`, after `wan_model.generate()` returns:
+Back in `generate_media()`, after `wan_model.generate()` returns:
 
 ```
 video_tensor = _collect_video_chunks(video, ...)   concat frame chunks
@@ -582,14 +709,14 @@ run_cli_job():  main loop detects job.cancel_requested
                 → session._request_cancel_unlocked(runtime.module)
                 → sets state["gen"]["abort"] = True
 
-generate_video(): checks state["gen"]["abort"] periodically
+generate_media(): checks state["gen"]["abort"] periodically
                   checks interrupt_check() callback from pipeline
 
 Pipeline:       interrupt_check() returns True
                 → denoising loop exits early
                 → pipeline returns (None, None)
 
-generate_video(): wan_model.generate() returns None
+generate_media(): wan_model.generate() returns None
                   → exits without saving file
 
 _run_tasks_worker(): detects abort flag
@@ -624,7 +751,7 @@ class family_handler:
 
     @staticmethod
     def validate_inputs(base_model_type, model_def, inputs):
-        """Optional: validate/normalise UI inputs before generate_video() is called."""
+        """Optional: validate/normalise UI inputs before generate_media() is called."""
         ...
 
     @staticmethod
@@ -675,7 +802,7 @@ To wire a new pipeline class into the server flow:
 4. **Add any new input keys** to `ATTACHMENT_KEYS` in `wangp_server.py` so that
    `"file:<id>"` references in nested structures are resolved before the job runs.
 
-5. **Thread the parameter** through `generate_video()` in `wgp.py` if it is not
+5. **Thread the parameter** through `generate_media()` in `wgp.py` if it is not
    already passed via `**kwargs` to `wan_model.generate()`.
 
 ---
@@ -685,8 +812,12 @@ To wire a new pipeline class into the server flow:
 - `shared/api.py` — `WanGPSession`, `SessionJob`, `SessionStream`, `GenerationResult`
 - `shared/api_cli.py` — `run_cli_job()`, `_run_tasks_worker()`, `_handle_command()`
 - `wangp_server.py` — `QueueWorker`, `JobStore`, `UploadStore`, FastAPI endpoints
-- `wgp.py:3638` — `load_models()`
-- `wgp.py:6180` — `generate_video()`
-- `wgp.py:7922` — `validate_task()`
-- `models/ltx2/ltx2.py:943` — `LTX2.generate()`
+- `wangp_server.py` — `_apply_h3_settings()`, `_apply_v2v_settings()` (settings normalisation)
+- `shared/config_groups.py` — comma-joined `config` selection encode/decode
+- `wgp.py:3909` — `load_models()`
+- `wgp.py:6418` — `generate_media()`
+- `wgp.py:8391` — `validate_task()`
+- `models/ltx2/ltx2.py:1144` — `LTX2.generate()`
 - `models/ltx2/ltx_pipelines/` — pipeline implementations
+- `models/minimax_h3/minimax_h3_handler.py` — `set_cache_parameters()`, `query_model_def()`
+- `models/minimax_h3/first_block_cache.py` — `MiniMaxH3FirstBlockCache`

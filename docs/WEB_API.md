@@ -229,13 +229,63 @@ Orthogonal to all four: the Qwen3-VL 32B text-encoder quantization (`bf16`, `int
 | `flow_shift` | `12.0` | model default |
 | output fps | 24 (fixed) | 4–15 s is the officially documented output range |
 
-Optional speed/memory knobs:
+##### Accelerators and RAM shrinkers (WanGP v12.434)
 
-- `skip_steps_cache_type: "spectrum"` + `skip_steps_start_step_perc: 25` — Spectrum
-  Feature Forecasting, the only step-skipping type H3 accepts (any other value raises).
-- Text-encoder quantization (Qwen3-VL 32B) is a *model configuration*, not a job
-  setting — pick it once in the UI / model definition (`bf16`, `int8`, `nvfp4_awq`,
-  `gguf_q4_k_m`, `gguf_q2_k`) rather than per request.
+Pick one or stack them — the exact gain depends on your video, hardware and settings.
+The server validates every field below at submission time, so a bad value comes back
+as a `400` instead of failing minutes into a run.
+
+**Step skipping** — `first_block` and `spectrum` are *alternatives*; either can be
+combined with Sol-Attn for an extra push.
+
+| Field | Values | Meaning |
+|---|---|---|
+| `skip_steps_cache_type` | `""`, `"first_block"`, `"spectrum"` | First Block Cache runs the first block and reuses the remaining blocks' previous result when little has changed — TeaCache's cool cousin, driven by the first block's output. Tuned to add very little VRAM overhead. |
+| `skip_steps_multiplier` | `0.06`, `0.08`, `0.10`, `0.12`, `0.14` | First Block Cache threshold. `0.08` ("Balanced") is the upstream default; higher thresholds skip more work and go faster, with a possible trade in motion or fine detail. |
+| `skip_steps_start_step_perc` | `0`–`100` | *When* skipping may begin, in percent of the generation. It is not an acceleration factor. |
+
+**Sol-Attn** — `override_attention: "sol"`. Sparse attention that speeds up large
+visual sequences. Requires BF16, Triton 3.6+ and a compatible NVIDIA GPU (RTX 40/50-series,
+H100/H200, or B100/B200). Expect 10–20 % on RTX 40-series and around 30 % on RTX
+50-series, with a possible small quality trade-off.
+
+**Model configuration** — WanGP encodes these as a single comma-joined `config`
+string (`"<text_encoder>,<video_vae>,<dit_priority>,<finetune>"`). The API accepts
+that string directly, or the three convenience fields below, which it merges into
+`config` for you:
+
+| Field | Values | Meaning |
+|---|---|---|
+| `video_vae` | `""`, `"fp8mix"` | FP8 Mixed Precision Video VAE — reduces the RAM occupied by H3's Video VAE weights. Thanks to Kijai for the quantized VAE. |
+| `text_encoder` | `"bf16"`, `"int8"`, `"nvfp4_awq"`, `"gguf_q4_k_m"`, `"gguf_q2_k"` | Qwen3-VL 32B text-encoder precision. |
+| `dit_priority` | `""`, `"lower_ram"` | DiT denoising priority; `lower_ram` disables QKV splitting. |
+
+**W4A8 INT8 checkpoints** — H3 can load asymmetric W4A8 checkpoints. Their 4-bit
+weights shrink the checkpoint and system RAM use, while 8-bit activations use
+optimized INT8 kernels on RTX 30-series or newer. These are added as finetunes
+(see [`FINETUNES.md`](FINETUNES.md)), not as job settings; once registered, select
+one through `model_type` like any other model.
+
+**LoRAs** — pruned and non-pruned models now read either LoRA format; the
+translation happens automatically at load time, and pruned (rank 4) LoRAs also work
+on the original rank-64 pruned checkpoints. The Lightx2v and larryvrh H3 accelerator
+LoRAs ship as predefined profiles; over the API pass them through `activated_loras`
+with `loras_multipliers` around `0.5` (`1.0` tends to be too strong), and raise
+`num_inference_steps` to 8 if the quality is not there.
+
+```json
+{
+  "settings": {
+    "model_type": "minimax_h3_fl2va_pruned",
+    "skip_steps_cache_type": "first_block",
+    "skip_steps_multiplier": 0.08,
+    "skip_steps_start_step_perc": 25,
+    "override_attention": "sol",
+    "video_vae": "fp8mix",
+    "dit_priority": "lower_ram"
+  }
+}
+```
 
 ##### FL2VA — first / last frame
 
@@ -275,18 +325,42 @@ none is rejected.
 
 | Flag field | Value | Meaning | Attachment |
 |---|---|---|---|
-| `video_prompt_type` | `""` | no reference video | — |
-| | `"VG"` | one reference video | `video_guide` |
-| | `"V+G"` | two reference videos | `video_guide`, `video_guide2` |
+| `video_prompt_type` | `""` | no reference or control video | — |
+| | `"V-"` | one reference video | `video_guide` |
+| | `"V+-"` | two reference videos | `video_guide`, `video_guide2` |
+| | `"DV"` | Depth Control — guide the scene's depth and layout | `video_guide` |
+| | `"V"` | Generic Control — feed the clip directly to H3 | `video_guide` |
 | `audio_prompt_type` | `""` | no reference audio | — |
 | | `"A"` | one audio reference | `audio_guide` |
 | | `"AB"` | two audio references | `audio_guide`, `audio_guide2` |
 | | `"K"` | reuse the reference videos' soundtracks | — |
 | `video_prompt_type` | `"I"` | use reference images | `image_refs` (list) |
 
-> **Set `video_prompt_type` explicitly.** When `video_guide` is present and the field
-> is omitted, the server defaults it to `"DVG"` (LTX-2 depth-map conditioning), which
-> is wrong for H3. Send `"VG"` / `"V+G"`, adding `"I"` when you also pass `image_refs`.
+> **Control videos define the output canvas; reference videos do not.** Use a
+> *reference* video (`"V-"` / `"V+-"`) to reuse subjects, appearance or motion
+> without changing the output size.
+
+Rather than assembling the letters yourself, pass `control_video_mode` and the
+server expands it into `video_prompt_type`:
+
+| `control_video_mode` | → `video_prompt_type` |
+|---|---|
+| `"none"` | `""` |
+| `"reference"` | `"V-"` |
+| `"reference2"` | `"V+-"` |
+| `"depth"` | `"DV"` |
+| `"generic"` | `"V"` |
+
+> Set one of the two explicitly whenever `video_guide` is present. The LTX-2
+> auto-preprocessing that would otherwise default `video_prompt_type` to `"DVG"`
+> is skipped for H3 model types, so an omitted flag means *no* control video.
+
+**Reference-image pixel budget** — `image_refs_relative_size`, `50`–`400` (percent).
+The original implementation could feed a 4K reference image into a 480p video: great
+for detail, less great for your stopwatch. Lower is faster, `100` matches the output's
+pixel budget, higher favours fidelity. Aspect ratio is preserved and the output
+resolution is unchanged. The server defaults this to `100` when `image_refs` is
+present — the setting behind Ref2VA now being roughly twice as fast as before.
 
 Validation rules enforced before the job runs (violations return an error instead of
 a bad generation):
@@ -312,6 +386,7 @@ a bad generation):
     "sample_solver": "euler",
     "video_prompt_type": "I",
     "image_refs": ["file:upload_1714500000_a3f7c2b1"],
+    "image_refs_relative_size": 100,
     "audio_prompt_type": "A",
     "audio_guide": "file:upload_1714500000_d4b8e1c9"
   }
