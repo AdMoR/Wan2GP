@@ -186,14 +186,21 @@ audio — no audio remux step is needed.
 
 ##### Choosing the model
 
-There are exactly four `model_type` values — two families × two sizes:
+There are six `model_type` values — two families × two sizes, plus two 4-step Turbo
+variants of the FL2VA family:
 
-| `model_type` | UI name | Size | Use it when you have… |
-|---|---|---|---|
-| `minimax_h3_fl2va` | MiniMax H3 FL2VA 33B | 33B | text only, `image_start`, `image_end`, or both |
-| `minimax_h3_fl2va_pruned` | MiniMax H3 FL2VA Pruned 20B | 20B | same, cheaper |
-| `minimax_h3_ref2va` | MiniMax H3 Ref2VA 33B | 33B | `image_refs`, `video_guide` / `video_guide2`, `audio_guide` / `audio_guide2` |
-| `minimax_h3_ref2va_pruned` | MiniMax H3 Ref2VA Pruned 20B | 20B | same, cheaper |
+| `model_type` | UI name | Size | Steps | Use it when you have… |
+|---|---|---|---|---|
+| `minimax_h3_fl2va` | MiniMax H3 FL2VA 33B | 33B | ~20 | text only, `image_start`, `image_end`, or both |
+| `minimax_h3_fl2va_pruned` | MiniMax H3 FL2VA Pruned 20B | 20B | ~20 | same, cheaper |
+| `minimax_h3_fl2va_turbo` | MiniMax H3 FL2VA Turbo 4 steps 33B | 33B | **4** | same as FL2VA, ~5× faster (see [Turbo](#turbo--4-step-distilled-fl2va)) |
+| `minimax_h3_fl2va_pruned_turbo` | MiniMax H3 FL2VA Turbo 4 steps Pruned 20B | 20B | **4** | same, cheaper — **this is the model the server preloads at startup** |
+| `minimax_h3_ref2va` | MiniMax H3 Ref2VA 33B | 33B | ~20 | `image_refs`, `video_guide` / `video_guide2`, `audio_guide` / `audio_guide2` |
+| `minimax_h3_ref2va_pruned` | MiniMax H3 Ref2VA Pruned 20B | 20B | ~20 | same, cheaper |
+
+The Turbo variants belong to the **FL2VA** family and take exactly the same inputs and
+settings as the non-Turbo FL2VA models — everything in the FL2VA sections below applies
+unchanged. There is no Ref2VA Turbo: the distillation LoRA is FL2V-only.
 
 **The family choice (FL2VA vs Ref2VA) is decided by your inputs, and it is enforced —
 not advisory.** Sending an input to the wrong family fails the job (see
@@ -225,8 +232,8 @@ Orthogonal to all four: the Qwen3-VL 32B text-encoder quantization (`bf16`, `int
 | `resolution` | both dimensions multiples of 32 | `block_size = 32` |
 | `guidance_scale` | `1.0` | H3 has `guidance_max_phases = 0` — CFG is not used |
 | `sample_solver` | `"euler"` | the only solver H3 exposes |
-| `num_inference_steps` | ~20 | |
-| `flow_shift` | `12.0` | model default |
+| `num_inference_steps` | ~20 — **4** on the Turbo model types | |
+| `flow_shift` | `12.0` | model default; **the Turbo variants require it** — the distillation LoRA was trained on this schedule |
 | output fps | 24 (fixed) | 4–15 s is the officially documented output range |
 
 ##### Accelerators and RAM shrinkers (WanGP v12.434)
@@ -271,7 +278,56 @@ translation happens automatically at load time, and pruned (rank 4) LoRAs also w
 on the original rank-64 pruned checkpoints. The Lightx2v and larryvrh H3 accelerator
 LoRAs ship as predefined profiles; over the API pass them through `activated_loras`
 with `loras_multipliers` around `0.5` (`1.0` tends to be too strong), and raise
-`num_inference_steps` to 8 if the quality is not there.
+`num_inference_steps` to 8 if the quality is not there. **For 4-step acceleration you
+do not need any of this — use the Turbo `model_type` values below, which carry the
+LoRA and its multiplier in the model definition.**
+
+##### Turbo — 4-step distilled FL2VA
+
+`minimax_h3_fl2va_turbo` and `minimax_h3_fl2va_pruned_turbo` bundle the
+[lightx2v Turbo v0.1](https://huggingface.co/lightx2v/Minimax-h3-Turbo) distillation
+LoRA (`minimax_h3_fl2v_turbo_4step_v0.1.safetensors`, rank 128) directly in the model
+definition, so **the client sends no LoRA fields at all** — no `activated_loras`, no
+`loras_multipliers`. The LoRA is downloaded on first use and applied automatically at
+the multiplier the distillation expects.
+
+| Setting | Value |
+|---|---|
+| `num_inference_steps` | `4` (the model default; there is no CFG, so 4 steps = 4 forward passes) |
+| `flow_shift` | `12.0` — **do not change it**, the LoRA was distilled on this schedule |
+| `guidance_scale` | `1.0` |
+| everything else | identical to plain FL2VA |
+
+A minimal request — every field below except `model_type` and `prompt` is already the
+model default and is shown only for clarity:
+
+```json
+{
+  "settings": {
+    "model_type": "minimax_h3_fl2va_pruned_turbo",
+    "prompt": "a jazz duo performing in a softly lit club",
+    "resolution": "832x480",
+    "video_length": 124,
+    "sliding_window_size": 124,
+    "sliding_window_overlap": 1,
+    "num_inference_steps": 4,
+    "flow_shift": 12.0,
+    "guidance_scale": 1.0,
+    "sample_solver": "euler"
+  }
+}
+```
+
+Measured on the reference box (NVIDIA GB10, pruned INT8 checkpoint, 832×480 × 124
+frames): **~1 min 35 s** for the 4 steps, against ~21 s/step for the 20-step model.
+
+Two caveats:
+
+- **v0.1 preview quality.** Motion, framing and audio sync hold up well; fine image
+  detail is softer than the 20-step model. Use a non-Turbo model type when detail
+  matters more than latency.
+- **Do not stack step skipping on top.** `skip_steps_cache_type` skipping one of only
+  four steps is a large quality loss for a small gain. Leave it `""` on Turbo jobs.
 
 ```json
 {
@@ -405,8 +461,9 @@ checkpoint cannot consume, at the start of `generate()` in
 ValueError: Image, video, and audio references require the Ref2VA checkpoint
 ```
 
-Raised when `model_type` is `minimax_h3_fl2va` / `minimax_h3_fl2va_pruned` and *any*
-of the following is present in the request:
+Raised when `model_type` is any FL2VA variant — `minimax_h3_fl2va`,
+`minimax_h3_fl2va_pruned`, `minimax_h3_fl2va_turbo`, `minimax_h3_fl2va_pruned_turbo`
+— and *any* of the following is present in the request:
 
 - a non-empty `image_refs` list,
 - an `input_frames` / control-video attachment,
@@ -1372,6 +1429,12 @@ curl -s -X POST http://localhost:8082/jobs \
   -H "Content-Type: application/json" \
   -H "X-API-Key: my-secret" \
   -d '{"settings": {"model_type": "minimax_h3_fl2va_pruned", "prompt": "a jazz duo performing in a softly lit club", "resolution": "832x480", "video_length": 124, "sliding_window_size": 124, "sliding_window_overlap": 1, "num_inference_steps": 20, "guidance_scale": 1.0, "flow_shift": 12.0, "sample_solver": "euler"}}'
+
+# Same job on the 4-step Turbo model (~5x faster, no LoRA fields needed)
+curl -s -X POST http://localhost:8082/jobs \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: my-secret" \
+  -d '{"settings": {"model_type": "minimax_h3_fl2va_pruned_turbo", "prompt": "a jazz duo performing in a softly lit club", "resolution": "832x480", "video_length": 124, "sliding_window_size": 124, "sliding_window_overlap": 1, "num_inference_steps": 4, "guidance_scale": 1.0, "flow_shift": 12.0, "sample_solver": "euler"}}'
 
 # Poll status
 curl -s http://localhost:8082/jobs/job_1714500000_b9e2d4f0 \

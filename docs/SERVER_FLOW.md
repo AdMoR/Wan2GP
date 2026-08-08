@@ -114,8 +114,9 @@ input untouched for families it does not own.
 `POST /jobs/raw` deliberately skips **both**, passing settings through verbatim for
 callers who want full manual flag control.
 
-**`_apply_h3_settings()`** — MiniMax H3 (`minimax_h3_fl2va[_pruned]`,
-`minimax_h3_ref2va[_pruned]`).  Validates the v12.434 accelerators against constants
+**`_apply_h3_settings()`** — MiniMax H3 (`minimax_h3_fl2va[_pruned][_turbo]`,
+`minimax_h3_ref2va[_pruned]`; the full list is `H3_MODEL_TYPES` in `wangp_server.py`,
+which every new H3 model type must be added to or it silently skips this validation).  Validates the v12.434 accelerators against constants
 mirrored from `models/minimax_h3/minimax_h3_handler.py`, and expands API-friendly
 aliases into the keys `wgp.generate_media()` actually consumes:
 

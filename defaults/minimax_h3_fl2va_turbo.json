@@ -1,0 +1,14 @@
+{
+    "model": {
+        "name": "MiniMax H3 FL2VA Turbo 4 steps 33B",
+        "architecture": "minimax_h3_fl2va",
+        "description": "First/Last-Frame-to-Video-and-Audio accelerated by the lightx2v Turbo 4 step distillation LoRA. This is a v0.1 preview: generation is much faster but fine image details are still weaker than the base model. Keep the flow shift at 12, it is the schedule the LoRA was distilled on.",
+        "URLs": "minimax_h3_fl2va",
+        "loras": ["https://huggingface.co/lightx2v/Minimax-h3-Turbo/resolve/main/minimax_h3_fl2v_turbo_4step_v0.1.safetensors"],
+        "loras_multipliers": [0.0625]
+    },
+    "prompt": "integrated_multimodal_description: [Shot 1] A five-second cinematic single take inside a rain-lashed glass observatory at midnight. A radio astronomer sits before an antique brass receiver while electric-blue constellations drift across a translucent star map behind her. The camera makes a slow push from medium shot to close-up as the receiver emits three precise tones. She leans toward its microphone, looks up with sudden hope, and says clearly (S1) <d>[English] If you can hear me, follow this signal.</d> While finishing the line, she presses the transmit key; one brilliant blue pulse races across the star map and lights her restrained smile. Her speech completes naturally within the shot with precise lip synchronization.\noverall_soundscape: Rain rattling across the observatory dome, a low electrical hum, three clean receiver tones, a brass switch clicking, the astronomer's synchronized voice, and a short stereo transmission pulse.\nnon_diegetic_music: One quiet bowed-glass chord rising beneath the transmission and fading at the end.",
+    "num_inference_steps": 4,
+    "flow_shift": 12,
+    "guidance_scale": 1.0
+}

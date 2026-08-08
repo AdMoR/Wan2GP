@@ -664,6 +664,8 @@ def _enqueue_settings(settings: dict[str, Any]) -> dict:
 H3_MODEL_TYPES = (
     "minimax_h3_fl2va",
     "minimax_h3_fl2va_pruned",
+    "minimax_h3_fl2va_turbo",
+    "minimax_h3_fl2va_pruned_turbo",
     "minimax_h3_ref2va",
     "minimax_h3_ref2va_pruned",
 )
