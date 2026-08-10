@@ -217,6 +217,9 @@ def _format_sse(payload: dict) -> str:
 # ── Job State & Store ─────────────────────────────────────────────────────────
 
 
+_JOB_STATUSES = {"queued", "running", "completed", "cancelled", "failed"}
+
+
 @dataclass
 class JobState:
     job_id: str
@@ -312,6 +315,24 @@ class JobStore:
                 stale = [jid for jid, j in self._jobs.items() if j.done and j.created_at < cutoff]
                 for jid in stale:
                     del self._jobs[jid]
+
+
+def _cancel_job_state(job: JobState) -> dict:
+    """Cancel a single job. Queued jobs stop immediately, running ones best-effort."""
+    if job.status == "queued":
+        job.cancel_requested = True
+        job.status = "cancelled"
+        job._done_event.set()
+        _job_store.recalc_positions()
+        return {"job_id": job.job_id, "status": "cancelled"}
+
+    if job.done:
+        return {"job_id": job.job_id, "status": job.status}
+
+    job.cancel_requested = True
+    if job.wangp_job is not None:
+        job.wangp_job.cancel()
+    return {"job_id": job.job_id, "status": "cancelling"}
 
 
 # ── Queue Worker ──────────────────────────────────────────────────────────────
@@ -1382,6 +1403,86 @@ async def submit_job_raw(body: JobSubmitRequest, _: None = Depends(_check_api_ke
     return _enqueue_settings(body.settings)
 
 
+@app.get("/jobs", summary="List jobs", tags=["Jobs"])
+async def list_jobs(
+    status: Optional[str] = None,
+    _: None = Depends(_check_api_key),
+) -> dict:
+    """List all jobs currently held by the server, oldest first.
+
+    Jobs are kept in memory only and evicted once done and older than
+    `WANGP_JOB_TTL`, so this reflects the live queue, not a full history.
+
+    **Query parameters**
+    - `status` – optional filter, one of `queued | running | completed | failed | cancelled`
+
+    **Response fields**
+    - `jobs` – list of `{job_id, status, created_at, queue_position, model_type}`;
+      `queue_position` is `null` unless the job is queued or running
+    - `total` – number of jobs returned
+    - `queue_depth` – number of jobs currently waiting in the pending queue
+
+    **Errors**
+    - `400` – unknown `status` value
+    """
+    if status is not None and status not in _JOB_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown status '{status}'; expected one of {sorted(_JOB_STATUSES)}",
+        )
+
+    jobs = sorted(_job_store.all_jobs(), key=lambda j: j.created_at)
+    out = []
+    for job in jobs:
+        if status is not None and job.status != status:
+            continue
+        if job.status == "running":
+            position: Optional[int] = 0
+        elif job.status == "queued":
+            position = job.queue_position
+        else:
+            position = None
+        out.append(
+            {
+                "job_id": job.job_id,
+                "status": job.status,
+                "created_at": job.created_at,
+                "queue_position": position,
+                "model_type": job.settings.get("model_type"),
+            }
+        )
+
+    return {"jobs": out, "total": len(out), "queue_depth": _job_store.queue_depth()}
+
+
+@app.delete("/jobs", summary="Cancel all pending jobs", tags=["Jobs"])
+async def cancel_all_jobs(
+    include_running: bool = False,
+    _: None = Depends(_check_api_key),
+) -> dict:
+    """Clear the queue by cancelling every pending job.
+
+    By default only `queued` jobs are cancelled, leaving the in-flight generation
+    to finish.  Pass `include_running=true` to also signal the running job, which
+    is cancelled best-effort exactly as `DELETE /jobs/{job_id}` does.
+
+    **Response fields**
+    - `cancelled` – list of `{job_id, status}` for each affected job
+    - `count` – number of jobs signalled
+    - `queue_depth` – remaining pending queue depth
+    """
+    cancelled = []
+    for job in sorted(_job_store.all_jobs(), key=lambda j: j.created_at):
+        if job.status == "queued" or (include_running and not job.done):
+            cancelled.append(_cancel_job_state(job))
+
+    return {
+        "cancelled": cancelled,
+        "count": len(cancelled),
+        "queue_depth": _job_store.queue_depth(),
+    }
+
+
 @app.get("/jobs/{job_id}", summary="Poll job status", tags=["Jobs"])
 async def get_job(job_id: str, request: Request, _: None = Depends(_check_api_key)) -> dict:
     """Return the current status and result of a generation job.
@@ -1458,20 +1559,7 @@ async def cancel_job(job_id: str) -> dict:
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    if job.status == "queued":
-        job.cancel_requested = True
-        job.status = "cancelled"
-        job._done_event.set()
-        _job_store.recalc_positions()
-        return {"job_id": job_id, "status": "cancelled"}
-
-    if job.done:
-        return {"job_id": job_id, "status": job.status}
-
-    job.cancel_requested = True
-    if job.wangp_job is not None:
-        job.wangp_job.cancel()
-    return {"job_id": job_id, "status": "cancelling"}
+    return _cancel_job_state(job)
 
 
 @app.get("/jobs/{job_id}/events", summary="Stream job events (SSE)", tags=["Jobs"])

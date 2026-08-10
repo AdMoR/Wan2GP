@@ -55,7 +55,7 @@ Requests with a missing or wrong key receive `401 Unauthorized`.
 POST /jobs  →  queued  →  running  →  completed
                                    ↘  failed
             ↓
-         cancelled  (via DELETE /jobs/{job_id})
+         cancelled  (via DELETE /jobs/{job_id}, or DELETE /jobs for the whole queue)
 ```
 
 Jobs are processed one at a time in submission order.  While a job is queued
@@ -386,8 +386,8 @@ none is rejected.
 | | `"V+-"` | two reference videos | `video_guide`, `video_guide2` |
 | | `"DV"` | Depth Control — guide the scene's depth and layout | `video_guide` |
 | | `"V"` | Generic Control — feed the clip directly to H3 | `video_guide` |
-| `audio_prompt_type` | `""` | no reference audio | — |
-| | `"A"` | one audio reference | `audio_guide` |
+| `audio_prompt_type` | `""` | no reference audio — H3 invents the voice | — |
+| | `"A"` | one audio reference — clones the voice; **bind `<Audio 1>` in the prompt** or it replays the clip's words, see below | `audio_guide` |
 | | `"AB"` | two audio references | `audio_guide`, `audio_guide2` |
 | | `"K"` | reuse the reference videos' soundtracks | — |
 | `video_prompt_type` | `"I"` | use reference images | `image_refs` (list) |
@@ -429,11 +429,114 @@ a bad generation):
   selected video but no extra file.
 - `"K"` requires every reference video to actually have an audio track.
 
+###### Voice cloning: the prompt decides whether `<Audio N>` is copied or referenced
+
+> **`audio_prompt_type` has no timbre-vs-copy switch.** All of `"A"` / `"AB"` /
+> `"K"` push the waveform through one identical path in
+> `pipeline.py:_add_audio_reference`. Whether H3 *clones the voice* or *replays
+> the clip's words* is decided entirely by how your prompt binds the
+> `<Audio N>` label. Get the binding wrong and the clip's original words
+> replace your `<d>…</d>` dialogue **and** visual prompt adherence collapses.
+
+The text encoder never hears the audio — Qwen3-VL has no audio tower, and
+`text_encoder.py:_presentation` injects only the literal string `"<Audio 1>: "`
+into the token stream. The waveform reaches the DiT as clean condition rows
+(`AUDIO_COND_TIMESTEP = 1.0`, no noise augmentation, unlike image references at
+`0.999`). The label is a *binding site*: unbound clean audio defaults to being
+content.
+
+**Measured**, `minimax_h3_ref2va_pruned`, 480x832, 141 frames, 30 steps,
+flow_shift 12.0, one identity image in `image_refs`, seed 4001, same 10 s French
+speech clip as `audio_guide` — only the prompt wording differs. Speaker
+similarity is CAM++ cosine against the reference clip:
+
+| Run | `audio_prompt_type` | Transcript | Voice match |
+|---|---|---|---|
+| ❌ loose binding | `"A"` | `"sur Batman. On reçoit un petit coup de fil…"` — the *clip's* words | +0.83 |
+| ✅ contract binding | `"A"` | `"Numéro 4, le transfert de Philippe Coutinho au FC Barcelone, 135 millions d'euros."` — the scripted line | **+0.85** |
+| no audio reference | `""` | scripted line, correct | +0.29 (unrelated voice) |
+
+So the voice clones either way; only the loose binding also leaks the words. The
+video followed suit — the loose run produced a generic stadium shot in the wrong
+kit with no on-screen graphic, while the contract run rendered the prompt's
+tunnel mouth, blue-and-garnet kit, ball under the boot and the
+`#4 / 135 MILLIONS D'EUROS` LED board.
+
+**The contract has four parts** (MiniMax's own worked example is mirrored in
+`models/minimax_h3/prompt_enhancer.py`, "Reuse a character and reference a
+voice"). All four must be present — the failing prompt had only the first.
+
+| # | Section | Required |
+|---|---|---|
+| 1 | `subject_definitions` | an `<Audio 1>` entry saying it *supplies the reference for* the voice, "without copying its original words or background noise" |
+| 2 | `summary` | task tag `[reference generation + audio reference]` |
+| 3 | `retention_analysis` | `<Audio 1> (heard in [Shot N]): reference - …` — the `reference` keyword **and** the shot anchor |
+| 4 | `detailed_description` | cite `<Audio 1>` **inline at the `<d>…</d>` line** |
+
+Part 4 is the one that actually decides it. Declaring intent in the header
+sections while leaving `<Audio 1>` uncited at the moment of speech is what
+produced the failure above.
+
+**DON'T** — intent declared in the headers, label never bound at the dialogue:
+
+```text
+summary:
+[reference generation] … the commentator's voice references the timbre of <Audio 1>.
+
+retention_analysis:
+<Audio 1>: reference - only the mature male voice timbre is referenced; the spoken
+French lines are newly generated, not copied from the source audio.
+
+detailed_description:
+… The commentator (S1) says in an off-screen voiceover, <d>[French] Numéro quatre :
+le transfert de Philippe Coutinho au FC Barcelone, cent trente-cinq millions d'euros !</d>
+```
+
+Note the prompt *asserts* "not copied from the source audio" and is ignored
+anyway. Asserting the outcome does not bind the label.
+
+**DO** — same clip, same seed, words now obeyed:
+
+```text
+subject_definitions:
+<Audio 1> supplies the reference for the off-screen commentator's (S1) mature male
+voice, its timbre, measured broadcast pace, and confident delivery, without copying
+its original words or background noise.
+
+summary:
+[reference generation + audio reference] … <Subject 1>'s identity from <Picture 1> is
+preserved, and <Audio 1> is used as the reference for the commentator's speaking voice.
+
+retention_analysis:
+<Audio 1> (heard in [Shot 1]): reference - vocal timbre, mature male register, and
+measured broadcast delivery guide the new dialogue; source wording and ambience are
+not copied.
+
+detailed_description:
+… The commentator (S1) speaks in an off-screen voiceover, in the mature male broadcast
+voice referenced from <Audio 1>, saying <d>[French] Numéro quatre : le transfert de
+Philippe Coutinho au FC Barcelone, cent trente-cinq millions d'euros !</d>
+```
+
+Use `fully_copy` / `partially_copy` in `retention_analysis` instead of
+`reference` when you *do* want the clip's audio reproduced.
+
+If you would rather not depend on prompt wording, the deterministic alternative
+is `audio_prompt_type: ""` plus post-processing voice conversion
+(`replace_voice_method: "seedvc_one_speaker"` with `replace_voice_sample`), which
+separates words from timbre by construction. It converts the whole soundtrack,
+so mixed-in crowd noise and music may degrade.
+
+Also note the reference audio is **not** trimmed to the clip length: the Ref2VA
+pipeline reloads the uploaded file in full (`wgp.py` passes the path, bypassing
+its own window slice), so a 10 s reference is conditioned in whole even for a
+5.9 s output. Keep voice references short and clean.
+
 ```json
 {
   "settings": {
     "model_type": "minimax_h3_ref2va_pruned",
-    "prompt": "The referenced performer sings on a softly lit stage, preserving identity, costume and voice; natural lip motion, realistic room acoustics.",
+    "prompt": "The referenced performer sings on a softly lit stage, preserving identity and costume; natural lip motion, realistic room acoustics.",
     "resolution": "832x480",
     "video_length": 124,
     "num_inference_steps": 20,
@@ -448,6 +551,10 @@ a bad generation):
   }
 }
 ```
+
+> The `prompt` above is abbreviated. With `audio_prompt_type: "A"` it must carry
+> the full four-part `<Audio 1>` binding shown in the **DO** example, or the
+> reference clip's words will replace the scripted dialogue.
 
 ##### Checkpoint / input mismatch errors
 
@@ -998,6 +1105,90 @@ or, for a job that was still running when the request arrived:
 
 ---
 
+### `GET /jobs`
+
+List every job the server currently holds, oldest first.  Jobs live in memory only
+and are evicted once done and older than `WANGP_JOB_TTL`, so this reflects the live
+queue rather than a full history.
+
+**Query parameters**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `status` | string | Optional filter: `queued \| running \| completed \| failed \| cancelled` |
+
+**Response `200`**
+
+```json
+{
+  "jobs": [
+    {
+      "job_id": "job_1714500000_b9e2d4f0",
+      "status": "running",
+      "created_at": 1714500000.12,
+      "queue_position": 0,
+      "model_type": "minimax_h3"
+    },
+    {
+      "job_id": "job_1714500042_1c7a9be3",
+      "status": "queued",
+      "created_at": 1714500042.87,
+      "queue_position": 0,
+      "model_type": "ltxv_2_22B"
+    }
+  ],
+  "total": 2,
+  "queue_depth": 1
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `jobs[].created_at` | float | Unix timestamp of submission |
+| `jobs[].queue_position` | integer \| null | Zero-based position; `0` while running, `null` once done |
+| `jobs[].model_type` | string \| null | `model_type` from the submitted settings |
+| `total` | integer | Number of jobs returned (after filtering) |
+| `queue_depth` | integer | Jobs currently waiting in the pending queue |
+
+**Errors**
+
+| Status | Description |
+|---|---|
+| `400` | Unknown `status` filter value |
+
+---
+
+### `DELETE /jobs`
+
+Clear the queue by cancelling every pending job.
+
+By default only `queued` jobs are cancelled, leaving the in-flight generation to
+finish.  Pass `include_running=true` to also signal the running job — cancelled
+best-effort, exactly as `DELETE /jobs/{job_id}` does.
+
+**Query parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `include_running` | boolean | `false` | Also cancel the currently running job |
+
+**Response `200`**
+
+```json
+{
+  "cancelled": [
+    {"job_id": "job_1714500042_1c7a9be3", "status": "cancelled"},
+    {"job_id": "job_1714500061_44b0c210", "status": "cancelled"}
+  ],
+  "count": 2,
+  "queue_depth": 0
+}
+```
+
+Jobs that were already finished are left untouched and never appear in `cancelled`.
+
+---
+
 ### `GET /jobs/{job_id}/events`
 
 Stream real-time generation events as [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) (SSE).
@@ -1450,6 +1641,14 @@ curl -OJ http://localhost:8082/files/output_b9e2d4f0.mp4 \
 
 # Cancel a job
 curl -X DELETE http://localhost:8082/jobs/job_1714500000_b9e2d4f0 \
+  -H "X-API-Key: my-secret"
+
+# List jobs (optionally filtered)
+curl -s "http://localhost:8082/jobs?status=queued" \
+  -H "X-API-Key: my-secret"
+
+# Clear the queue (add ?include_running=true to also stop the running job)
+curl -X DELETE http://localhost:8082/jobs \
   -H "X-API-Key: my-secret"
 ```
 
